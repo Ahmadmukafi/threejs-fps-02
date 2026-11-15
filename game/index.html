@@ -3,70 +3,107 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RUSTLINE — tactical FPS</title>
+<link rel="icon" href="data:,">
+<title>RUSTLINE — Foundry Yard Tactical FPS</title>
 <style>
-  html, body { margin: 0; padding: 0; overflow: hidden; background: #1a1410; height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; }
-  #app { position: fixed; inset: 0; }
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0d10; height: 100%; font-family: 'Segoe UI', Arial, sans-serif; }
   canvas { display: block; }
-  #hud { position: fixed; inset: 0; pointer-events: none; color: #f0e8d8; text-shadow: 0 1px 3px rgba(0,0,0,.8); z-index: 5; }
-  #crosshair { position: absolute; left: 50%; top: 50%; width: 22px; height: 22px; transform: translate(-50%, -50%); }
-  #crosshair::before, #crosshair::after { content: ''; position: absolute; background: #f0e8d8; }
-  #crosshair::before { left: 10px; top: 0; width: 2px; height: 22px; }
-  #crosshair::after { left: 0; top: 10px; width: 22px; height: 2px; }
-  #health { position: absolute; left: 24px; bottom: 22px; font-size: 34px; font-weight: 700; }
-  #healthbar { position: absolute; left: 24px; bottom: 66px; width: 220px; height: 8px; background: rgba(0,0,0,.5); }
-  #healthbar::before { content: ''; display: block; height: 100%; width: 100%; background: #7ec850; }
-  #ammo { position: absolute; right: 28px; bottom: 22px; font-size: 30px; font-weight: 700; text-align: right; }
-  #money { position: absolute; right: 28px; bottom: 62px; font-size: 18px; color: #ffd27a; }
-  #timer { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); font-size: 28px; font-weight: 700; }
-  #score { position: absolute; left: 50%; top: 48px; transform: translateX(-50%); font-size: 15px; letter-spacing: 1px; }
-  #feed { position: absolute; right: 24px; top: 16px; text-align: right; font-size: 14px; line-height: 1.7; }
-  #banner { position: absolute; left: 50%; top: 22%; transform: translateX(-50%); font-size: 44px; font-weight: 800; letter-spacing: 2px; opacity: 0; transition: opacity .3s; text-align: center; width: 90%; }
-  #bannerSub { position: absolute; left: 50%; top: calc(22% + 54px); transform: translateX(-50%); font-size: 17px; opacity: 0; transition: opacity .3s; text-align: center; }
-  #vignette { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(ellipse at center, transparent 55%, rgba(160,20,10,.55) 100%); opacity: 0; z-index: 4; }
-  #channel { display: none; position: absolute; left: 50%; bottom: 120px; transform: translateX(-50%); width: 260px; }
-  #channelLabel { text-align: center; font-size: 14px; letter-spacing: 2px; margin-bottom: 6px; }
-  #channelFill { height: 8px; background: #ffd27a; width: 0%; }
-  #hint { position: absolute; left: 50%; bottom: 90px; transform: translateX(-50%); font-size: 14px; opacity: .85; }
-  #buy { display: none; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 420px; background: rgba(12,10,8,.92); border: 1px solid #6b5a3a; padding: 18px 22px; pointer-events: auto; z-index: 8; }
-  #buy h2 { margin: 0 0 12px; font-size: 20px; letter-spacing: 2px; color: #ffd27a; }
-  .buy-row { display: flex; gap: 10px; padding: 8px 4px; border-bottom: 1px solid rgba(255,255,255,.08); font-size: 16px; }
-  .buy-row.poor { opacity: .45; }
-  .buy-row.owned { color: #7ec850; }
-  .buy-key { color: #ffd27a; width: 20px; }
-  .buy-name { flex: 1; }
-  .buy-price { color: #ffd27a; }
-  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(10,8,6,.72); z-index: 10; cursor: pointer; }
-  #overlayTitle { font-size: 64px; font-weight: 800; letter-spacing: 8px; color: #ffd27a; }
-  #overlaySub { font-size: 17px; margin-top: 12px; color: #f0e8d8; max-width: 560px; text-align: center; line-height: 1.6; }
-  #end { display: none; position: fixed; inset: 0; flex-direction: column; align-items: center; justify-content: center; background: rgba(10,8,6,.78); z-index: 10; }
-  #endTitle { font-size: 52px; font-weight: 800; letter-spacing: 4px; color: #ffd27a; }
-  #endScore { font-size: 19px; margin-top: 14px; }
+  #hud { position: fixed; inset: 0; pointer-events: none; color: #e8e8e8; user-select: none; }
+  .hidden { display: none !important; }
+
+  /* crosshair: gap driven by --gap from weapon spread */
+  .crosshair { position: absolute; left: 50%; top: 50%; width: 0; height: 0; --gap: 8px; }
+  .crosshair span { position: absolute; background: #e8ffe8; box-shadow: 0 0 3px #000; }
+  .crosshair .ch-dot { width: 3px; height: 3px; left: -1.5px; top: -1.5px; border-radius: 50%; }
+  .crosshair .ch-t { width: 2px; height: 9px; left: -1px; top: calc(-1 * var(--gap) - 9px); }
+  .crosshair .ch-b { width: 2px; height: 9px; left: -1px; top: var(--gap); }
+  .crosshair .ch-l { width: 9px; height: 2px; top: -1px; left: calc(-1 * var(--gap) - 9px); }
+  .crosshair .ch-r { width: 9px; height: 2px; top: -1px; left: var(--gap); }
+
+  .hitmark { position: absolute; left: 50%; top: 50%; width: 26px; height: 26px; margin: -13px 0 0 -13px; opacity: 0; }
+  .hitmark::before, .hitmark::after { content: ''; position: absolute; inset: 0; background:
+    linear-gradient(45deg, transparent 46%, #fff 46%, #fff 54%, transparent 54%),
+    linear-gradient(-45deg, transparent 46%, #fff 46%, #fff 54%, transparent 54%); }
+  .hitmark.show { opacity: 1; }
+  .hitmark.kill::before, .hitmark.kill::after { filter: drop-shadow(0 0 4px #ff4040); }
+  .hitmark.kill { outline: 2px solid #ff4040; outline-offset: 2px; border-radius: 50%; }
+
+  .dmgdir { position: absolute; left: 50%; top: 50%; width: 130px; height: 130px; margin: -65px 0 0 -65px; opacity: 0; border-radius: 50%;
+    background: conic-gradient(from 0deg, transparent 0deg, rgba(255,40,40,0.85) 18deg, transparent 36deg, transparent 360deg); }
+  .dmgdir.show { opacity: 1; }
+
+  .flash { position: absolute; inset: 0; background: #fff; opacity: 0; transition: opacity 0.12s; }
+
+  .banner { position: absolute; left: 50%; top: 18%; transform: translateX(-50%); text-align: center; opacity: 0; transition: opacity 0.25s; }
+  .banner.show { opacity: 1; }
+  .banner-main { font-size: 42px; font-weight: 800; letter-spacing: 4px; text-shadow: 0 2px 12px #000; }
+  .banner-sub { font-size: 16px; color: #ffd27a; text-shadow: 0 1px 6px #000; }
+
+  .nudge { position: absolute; left: 50%; top: 30%; transform: translateX(-50%); font-size: 22px; font-weight: 700; color: #ffd24a;
+    text-shadow: 0 0 12px #000; opacity: 0; animation: nudgepulse 0.9s infinite alternate; }
+  .nudge.show { opacity: 1; }
+  @keyframes nudgepulse { from { transform: translateX(-50%) scale(1); } to { transform: translateX(-50%) scale(1.06); } }
+
+  .killfeed { position: absolute; right: 18px; top: 14px; text-align: right; font-size: 14px; line-height: 1.7; }
+  .kf-line { text-shadow: 0 1px 4px #000; }
+  .kf-v { color: #37d67a; font-weight: 700; }
+  .kf-s { color: #ff5252; font-weight: 700; }
+
+  .timer { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); text-align: center; font-size: 30px; font-weight: 800;
+    text-shadow: 0 2px 8px #000; }
+  .timer .timer-phase { display: block; font-size: 12px; letter-spacing: 3px; color: #ffd27a; }
+  .timer .urgent { color: #ff5252; animation: nudgepulse 0.5s infinite alternate; }
+
+  .score { position: absolute; left: 50%; top: 74px; transform: translateX(-50%); font-size: 15px; font-weight: 700; letter-spacing: 2px;
+    text-shadow: 0 1px 6px #000; }
+  .sc-v { color: #37d67a; } .sc-s { color: #ff5252; } .sc-dot { margin: 0 8px; color: #888; }
+
+  .money { position: absolute; left: 18px; top: 14px; font-size: 20px; font-weight: 800; color: #ffd24a; text-shadow: 0 1px 6px #000; }
+  .spike { position: absolute; left: 18px; top: 44px; font-size: 15px; font-weight: 700; color: #ffd24a; text-shadow: 0 1px 6px #000; }
+  .spike.planted { color: #ff5252; }
+
+  .health { position: absolute; left: 18px; bottom: 18px; display: flex; align-items: center; gap: 10px; }
+  .hp-num { font-size: 40px; font-weight: 800; text-shadow: 0 2px 8px #000; }
+  .hp-bar { width: 170px; height: 12px; background: rgba(0,0,0,0.6); border: 1px solid #555; }
+  .hp-bar i { display: block; height: 100%; background: linear-gradient(90deg, #37d67a, #7be495); }
+  .armor { color: #7ad4ff; font-weight: 700; }
+
+  .ammo { position: absolute; right: 18px; bottom: 18px; text-align: right; text-shadow: 0 2px 8px #000; }
+  .ammo-mag { font-size: 44px; font-weight: 800; }
+  .ammo-res { font-size: 20px; color: #aaa; }
+  .weapon { position: absolute; right: 18px; bottom: 78px; font-size: 14px; letter-spacing: 2px; color: #ccc; text-shadow: 0 1px 6px #000; }
+
+  .hint { position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); font-size: 12px; color: #999; text-shadow: 0 1px 4px #000; }
+  .minimap { position: absolute; right: 18px; top: 120px; border: 1px solid rgba(255,255,255,0.25); background: rgba(0,0,0,0.4); }
+
+  .buymenu { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 420px; background: rgba(10,12,16,0.92);
+    border: 1px solid #444; padding: 18px; pointer-events: auto; }
+  .buy-title { font-size: 18px; font-weight: 800; letter-spacing: 2px; margin-bottom: 12px; color: #ffd24a; }
+  .buy-list { display: flex; flex-direction: column; gap: 6px; }
+  .buy-item { display: flex; justify-content: space-between; background: #1c2126; color: #e8e8e8; border: 1px solid #333;
+    padding: 9px 12px; font-size: 14px; cursor: pointer; text-align: left; }
+  .buy-item:hover { background: #2a3430; border-color: #37d67a; }
+  .buy-key { color: #ffd24a; font-weight: 700; margin-right: 8px; }
+  .buy-price { color: #ffd24a; font-weight: 700; }
+  .buy-close { margin-top: 12px; width: 100%; padding: 9px; background: #333; color: #fff; border: none; cursor: pointer; font-size: 14px; }
+
+  .endscreen { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(5,6,8,0.82); pointer-events: auto; }
+  .end-title { font-size: 56px; font-weight: 900; letter-spacing: 6px; }
+  .end-score { font-size: 40px; font-weight: 800; margin-top: 8px; }
+  .end-sub { margin-top: 14px; color: #aaa; }
+
+  .center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(5,6,8,0.55); pointer-events: none; }
+  .center .title { font-size: 64px; font-weight: 900; letter-spacing: 10px; text-shadow: 0 4px 20px #000; }
+  .center .sub { font-size: 18px; color: #ffd27a; margin-top: 10px; text-shadow: 0 2px 8px #000; }
 </style>
+</head>
+<body>
+<div id="hud"></div>
 <script type="importmap">
 { "imports": { "three": "./vendor/three/three.module.min.js" } }
 </script>
-</head>
-<body>
-<div id="app"></div>
-<div id="vignette"></div>
-<div id="hud">
-  <div id="crosshair"></div>
-  <div id="healthbar"></div>
-  <div id="health">100</div>
-  <div id="ammo">12 / 48</div>
-  <div id="money">$800</div>
-  <div id="timer">1:40</div>
-  <div id="score">Vanguard 0 — 0 Sentinel</div>
-  <div id="feed"></div>
-  <div id="banner"></div>
-  <div id="bannerSub"></div>
-  <div id="channel"><div id="channelLabel">PLANTING…</div><div id="channelFill"></div></div>
-  <div id="hint"></div>
-  <div id="buy"><h2>BUY — press 1–6, B to close</h2><div id="buyList"></div></div>
-</div>
-<div id="overlay"><div id="overlayTitle">RUSTLINE</div><div id="overlaySub">Vanguard vs Sentinel on the Foundry Yard. First to 5 rounds. Plant the charge or clear the yard — click to play.</div></div>
-<div id="end"><div id="endTitle"></div><div id="endScore"></div></div>
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>

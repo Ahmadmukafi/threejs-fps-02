@@ -1,137 +1,224 @@
-// RUSTLINE — the player. First-person movement with acceleration and
-// friction, mouse look with recoil kick, crouching and jumping, and AABB
-// collision against the map. The simulation steps at a fixed 60 Hz; this
-// module owns only the player's own state.
+// RUSTLINE — the player: first-person movement, mouse look, firing input.
+// Fixed-step: update(dt) runs at 60 Hz from main.js; rendering reads the
+// same state, so the sim and the picture never drift apart.
 
 import * as THREE from 'three';
-import { MOVE } from './config.js';
+import { CONFIG, WEAPONS, SITES } from './config.js';
 import { collideCircle } from './world.js';
 
 export class Player {
-  constructor(spawn) {
-    this.team = 'vanguard';
-    this.pos = spawn.clone();          // feet position
+  constructor(scene, camera, sounds, weapons, walls) {
+    this.scene = scene;
+    this.camera = camera;
+    this.sounds = sounds;
+    this.weapons = weapons;
+    this.walls = walls;
+    this.pos = new THREE.Vector3(0, 0, 18);
     this.vel = new THREE.Vector3();
-    this.yaw = 0;                      // facing north (-z), toward the defenders
-    this.pitch = 0;
-    this.hp = 100;
-    this.alive = true;
-    this.crouched = false;
-    this.onGround = true;
-    this.eyeHeight = MOVE.eyeStand;
-    this.recoil = 0;                   // camera kick, decays
-    this.moveAmount = 0;               // 0 still .. 1 full sprint (for spread)
-    this.keys = {};
-    this.sprinting = false;
-    this.stepAcc = 0;                  // footstep timer
-  }
-
-  get eye() {
-    return new THREE.Vector3(this.pos.x, this.pos.y + this.eyeHeight, this.pos.z);
-  }
-
-  // Forward / right vectors on the ground plane, from the yaw.
-  forward() {
-    return new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
-  }
-  right() {
-    return new THREE.Vector3(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
-  }
-
-  look(dx, dy) {
-    this.yaw -= dx * 0.0022;
-    this.pitch -= dy * 0.0022;
-    this.pitch = Math.max(-1.5, Math.min(1.5, this.pitch));
-  }
-
-  addRecoil(amount) {
-    this.recoil += amount;
-    this.pitch += amount * 0.55;
-  }
-
-  // One fixed step. input: { f, r, jump, sprint, crouch } in -1..1.
-  // Returns true when a footstep sound should play.
-  step(dt, input, colliders, onStep) {
-    if (!this.alive) return false;
-    const k = this.keys;
-    const f = (k['KeyW'] || k['ArrowUp'] ? 1 : 0) - (k['KeyS'] || k['ArrowDown'] ? 1 : 0);
-    const r = (k['KeyD'] || k['ArrowRight'] ? 1 : 0) - (k['KeyA'] || k['ArrowLeft'] ? 1 : 0);
-    this.sprinting = !!k['ShiftLeft'] && f > 0 && !this.crouched;
-    this.crouched = !!k['ControlLeft'] || !!k['KeyC'];
-
-    const targetEye = this.crouched ? MOVE.eyeCrouch : MOVE.eyeStand;
-    this.eyeHeight += (targetEye - this.eyeHeight) * Math.min(1, dt * 12);
-
-    const speed = this.crouched ? MOVE.crouchSpeed
-      : this.sprinting ? MOVE.sprintSpeed : MOVE.walkSpeed;
-    const fw = this.forward(), rt = this.right();
-    const wish = new THREE.Vector3()
-      .addScaledVector(fw, f)
-      .addScaledVector(rt, r);
-    if (wish.lengthSq() > 1) wish.normalize();
-    wish.multiplyScalar(speed);
-
-    // accelerate toward the wish velocity, friction when idle
-    const accel = this.onGround ? MOVE.accel : MOVE.airAccel;
-    this.vel.x += (wish.x - this.vel.x) * Math.min(1, accel * dt / speed * 2.2);
-    this.vel.z += (wish.z - this.vel.z) * Math.min(1, accel * dt / speed * 2.2);
-    if (f === 0 && r === 0 && this.onGround) {
-      const fr = Math.max(0, 1 - MOVE.friction * dt);
-      this.vel.x *= fr; this.vel.z *= fr;
-    }
-
-    // gravity + jump
-    this.vel.y -= MOVE.gravity * dt;
-    if (input.jump && this.onGround) {
-      this.vel.y = MOVE.jumpSpeed;
-      this.onGround = false;
-    }
-    this.pos.x += this.vel.x * dt;
-    this.pos.z += this.vel.z * dt;
-    this.pos.y += this.vel.y * dt;
-    if (this.pos.y <= 0) { this.pos.y = 0; this.vel.y = 0; this.onGround = true; }
-
-    collideCircle(colliders, this.pos, MOVE.radius);
-
-    // recoil decays; movement amount for the spread model
-    this.recoil = Math.max(0, this.recoil - dt * 0.12);
-    const planar = Math.hypot(this.vel.x, this.vel.z);
-    this.moveAmount = Math.min(1, planar / MOVE.walkSpeed);
-
-    // footsteps
-    let stepped = false;
-    if (planar > 1.2 && this.onGround) {
-      this.stepAcc += planar * dt;
-      if (this.stepAcc > 2.4) { this.stepAcc = 0; stepped = true; }
-    }
-    if (stepped && onStep) onStep();
-    return stepped;
-  }
-
-  // Apply the camera to a three.js camera object.
-  applyCamera(camera) {
-    camera.position.copy(this.eye);
-    camera.rotation.order = 'YXZ';
-    camera.rotation.y = this.yaw;
-    camera.rotation.x = this.pitch + this.recoil;
-    camera.rotation.z = 0;
-  }
-
-  damage(amount) {
-    if (!this.alive) return false;
-    this.hp -= amount;
-    if (this.hp <= 0) { this.hp = 0; this.alive = false; return true; }
-    return false;
-  }
-
-  reset(spawn) {
-    this.pos.copy(spawn);
-    this.vel.set(0, 0, 0);
     this.yaw = 0;
     this.pitch = 0;
     this.hp = 100;
-    this.alive = true;
+    this.armor = false;
+    this.money = CONFIG.economy.startMoney;
+    this.weaponId = 'p9';
+    this.mag = WEAPONS.p9.mag;
+    this.reserve = WEAPONS.p9.reserve;
+    this.grenades = 0;
+    this.bloom = 0;
     this.recoil = 0;
+    this.fireCooldown = 0;
+    this.reloadTimer = 0;
+    this.plantTimer = 0;
+    this.defuseTimer = 0;
+    this.alive = true;
+    this.crouched = false;
+    this.onGround = true;
+    this.vy = 0;
+    this.kills = 0;
     this.keys = {};
+    this.mouseDown = false;
+    this.yawRate = 0; // set by bots/spectator when they drive the camera
+    this.spectate = null;
+    this.stepTimer = 0;
+    this.isPlayer = true;
+    this.team = 'vanguard';
+    this.parts = null;
+    camera.rotation.order = 'YXZ';
+  }
+
+  reset(x, z, yaw) {
+    this.pos.set(x, 0, z);
+    this.vel.set(0, 0, 0);
+    this.yaw = yaw;
+    this.pitch = 0;
+    this.hp = 100;
+    this.alive = true;
+    this.bloom = 0;
+    this.recoil = 0;
+    this.fireCooldown = 0;
+    this.reloadTimer = 0;
+    this.plantTimer = 0;
+    this.defuseTimer = 0;
+    this.spectate = null;
+    this.vy = 0;
+  }
+
+  lookAt(x, z) {
+    this.yaw = Math.atan2(-(x - this.pos.x), -(z - this.pos.z));
+  }
+
+  get eye() {
+    const h = this.crouched ? CONFIG.player.eyeHeight - 0.45 : CONFIG.player.eyeHeight;
+    return new THREE.Vector3(this.pos.x, h + this.pos.y, this.pos.z);
+  }
+
+  get forward() {
+    return new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
+  }
+
+  get moving() {
+    return this.keys['KeyW'] || this.keys['KeyA'] || this.keys['KeyS'] || this.keys['KeyD'];
+  }
+
+  update(dt, game) {
+    if (!this.alive) return;
+    // Timers decay.
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+    this.bloom = Math.max(0, this.bloom - dt * 1.4);
+    this.recoil = Math.max(0, this.recoil - dt * 0.35);
+    if (this.reloadTimer > 0) {
+      this.reloadTimer -= dt;
+      if (this.reloadTimer <= 0) {
+        const def = WEAPONS[this.weaponId];
+        const need = def.mag - this.mag;
+        const take = Math.min(need, this.reserve);
+        this.mag += take;
+        this.reserve -= take;
+      }
+    }
+    // Movement: accelerate toward the wish direction, friction otherwise.
+    const speed = this.crouched ? CONFIG.player.crouchSpeed : CONFIG.player.walkSpeed;
+    let ix = 0, iz = 0;
+    if (this.keys['KeyW']) iz -= 1;
+    if (this.keys['KeyS']) iz += 1;
+    if (this.keys['KeyA']) ix -= 1;
+    if (this.keys['KeyD']) ix += 1;
+    const len = Math.hypot(ix, iz);
+    if (len > 0) { ix /= len; iz /= len; }
+    // Rotate the camera-space input (W = -z forward) by the yaw into world
+    // space: world = (ix·cos + iz·sin, -ix·sin + iz·cos).
+    const sin = Math.sin(this.yaw), cos = Math.cos(this.yaw);
+    const wx = ix * cos + iz * sin;
+    const wz = -ix * sin + iz * cos;
+    this.vel.x += wx * CONFIG.player.accel * dt;
+    this.vel.z += wz * CONFIG.player.accel * dt;
+    const hv = Math.hypot(this.vel.x, this.vel.z);
+    const maxV = speed * (this.keys['ShiftLeft'] ? 0.55 : 1);
+    if (hv > maxV) { this.vel.x *= maxV / hv; this.vel.z *= maxV / hv; }
+    if (len === 0) {
+      const f = Math.max(0, 1 - CONFIG.player.friction * dt);
+      this.vel.x *= f; this.vel.z *= f;
+    }
+    // Integrate with axis-separated collision so walls slide, never stick.
+    let nx = this.pos.x + this.vel.x * dt;
+    let nz = this.pos.z;
+    let c = collideCircle(nx, nz, CONFIG.player.radius, this.walls);
+    this.pos.x = c.x;
+    nx = this.pos.x;
+    nz = this.pos.z + this.vel.z * dt;
+    c = collideCircle(nx, nz, CONFIG.player.radius, this.walls);
+    this.pos.z = c.z;
+    // Vertical: simple gravity + jump.
+    if (this.keys['Space'] && this.onGround) { this.vy = CONFIG.player.jumpSpeed; this.onGround = false; }
+    this.vy -= CONFIG.player.gravity * dt;
+    this.pos.y += this.vy * dt;
+    if (this.pos.y <= 0) { this.pos.y = 0; this.vy = 0; this.onGround = true; }
+    // Footsteps.
+    if (hv > 1.5 && this.onGround) {
+      this.stepTimer -= dt * hv;
+      if (this.stepTimer <= 0) { this.stepTimer = 2.2; this.sounds.step(); }
+    }
+    // Firing: hold for autos, click for semi-autos (mouseDown edge handled by game).
+    const def = WEAPONS[this.weaponId];
+    const wantFire = def.auto ? this.mouseDown : this.mouseDown && !this._fired;
+    if (wantFire && this.fireCooldown <= 0 && this.reloadTimer <= 0 && this.mag > 0 && game.phase === 'live') {
+      this._fired = true;
+      this.fireCooldown = def.rate;
+      this.mag -= 1;
+      const origin = this.eye;
+      const dir = new THREE.Vector3(0, 0, -1).applyEuler(this.camera.rotation);
+      dir.y += this.recoil * 0.6;
+      game.shoot(this, origin, dir);
+      if (this.mag === 0) this.sounds.dryFire();
+    }
+    if (!this.mouseDown) this._fired = false;
+    // Camera follows the body, with recoil kick on pitch.
+    this.camera.position.copy(this.eye);
+    this.camera.rotation.set(this.pitch + this.recoil, this.yaw, 0);
+    this.weapons.viewmodel.visible = true;
+    // Plant / defuse channels: hold E inside a site while the bomb state fits.
+    this.updateChannel(dt, game);
+  }
+
+  updateChannel(dt, game) {
+    const inSite = (s) => {
+      const dx = this.pos.x - s.x, dz = this.pos.z - s.z;
+      return dx * dx + dz * dz < s.r * s.r;
+    };
+    const want = this.keys['KeyE'];
+    if (want && game.phase === 'live') {
+      if (game.bombState === 'carried' && this.team === 'vanguard' && (inSite(SITES.A) || inSite(SITES.B))) {
+        this.plantTimer += dt;
+        if (this.plantTimer >= CONFIG.round.plantSeconds) {
+          this.plantTimer = 0;
+          game.plantBomb(inSite(SITES.A) ? 'A' : 'B', this);
+        }
+        return;
+      }
+      if (game.bombState === 'planted' && this.team === 'sentinel') {
+        const s = SITES[game.bombSite];
+        if (inSite(s)) {
+          this.defuseTimer += dt;
+          if (this.defuseTimer >= CONFIG.round.defuseSeconds) {
+            this.defuseTimer = 0;
+            game.defuseBomb(this);
+          }
+          return;
+        }
+      }
+    }
+    this.plantTimer = 0;
+    this.defuseTimer = 0;
+  }
+
+  buy(id) {
+    const def = WEAPONS[id];
+    if (!def || this.money < def.price) return false;
+    if (def.armor) { if (this.armor) return false; this.armor = true; }
+    else if (def.grenade) { if (this.grenades >= 2) return false; this.grenades += 1; }
+    else {
+      this.weaponId = id;
+      this.mag = def.mag;
+      this.reserve = def.reserve;
+      this.weapons.equip(id, this.camera);
+    }
+    this.money -= def.price;
+    return true;
+  }
+
+  throwGrenade(game) {
+    if (this.grenades <= 0 || !this.alive) return;
+    this.grenades -= 1;
+    const dir = new THREE.Vector3(0, 0, -1).applyEuler(this.camera.rotation);
+    dir.y += 0.35;
+    dir.normalize();
+    game.spawnGrenade(this.eye, dir.multiplyScalar(13));
+  }
+
+  die(killer) {
+    this.alive = false;
+    this.mouseDown = false;
+    this.weapons.viewmodel.visible = false;
+    if (killer) killer.kills = (killer.kills || 0) + 1;
   }
 }

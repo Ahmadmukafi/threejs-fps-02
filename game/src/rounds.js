@@ -1,190 +1,159 @@
-// RUSTLINE — rounds. The state machine for a match: LOBBY (click to play)
-// -> BUY (buy phase, frozen in spawn) -> LIVE (the round plays) -> END
-// (banner, then the next buy phase) -> MATCH (a team reached 5).
-// It owns money, the score, the round timer, and the charge (plant/defuse).
+// RUSTLINE — rounds: the match state machine.
+// buy (15 s) -> live (100 s) -> end -> next round, first to 5 (max 9).
+// Vanguard attacks and plants; Sentinel defends and defuses. Every round
+// end pays the economy and the HUD banner names the reason.
 
-import * as THREE from 'three';
-import { ROUND, ECONOMY, WEAPONS, GRENADE } from './config.js';
+import { CONFIG, SITES, SPAWNS } from './config.js';
 
 export class RoundManager {
-  constructor() {
-    this.phase = 'lobby';     // lobby | buy | live | end | match
+  constructor(game) {
+    this.game = game;
     this.round = 0;
     this.score = { vanguard: 0, sentinel: 0 };
-    this.timer = 0;
-    this.money = ECONOMY.startMoney;
-    this.planted = null;      // { site: 'A'|'B', pos: Vector3, fuse: seconds }
-    this.planting = null;     // { by, site, progress }
-    this.defusing = null;     // { by, progress }
-    this.lastWinner = null;
-    this.lastReason = '';
-    this.matchWinner = null;
-    this.onEvent = null;      // (type, data) — the sim hooks sounds + HUD here
-  }
-
-  emit(type, data) {
-    if (this.onEvent) this.onEvent(type, data);
+    this.phase = 'lobby';
+    this.phaseTimer = 0;
+    this.fuseTimer = 0;
+    this.attackSite = 'A';
+    this.bombState = 'carried'; // carried | planted | exploded | defused
+    this.bombSite = null;
+    this.carrier = null;
+    this.roundLog = [];
+    this.matchOver = false;
+    this.winner = null;
   }
 
   startMatch() {
-    this.phase = 'buy';
-    this.round = 1;
+    this.round = 0;
     this.score = { vanguard: 0, sentinel: 0 };
-    this.timer = ROUND.buySeconds;
-    this.money = ECONOMY.startMoney;
-    this.planted = null;
-    this.planting = null;
-    this.defusing = null;
-    this.matchWinner = null;
-    this.emit('buy', { round: 1 });
+    this.matchOver = false;
+    this.winner = null;
+    this.startRound();
   }
 
   startRound() {
-    this.phase = 'live';
-    this.timer = ROUND.roundSeconds;
-    this.planted = null;
-    this.planting = null;
-    this.defusing = null;
-    this.emit('roundStart', { round: this.round });
-  }
-
-  // The round ends: award money, update the score, move to the next phase.
-  endRound(winner, reason) {
-    if (this.phase === 'end' || this.phase === 'match') return;
-    this.lastWinner = winner;
-    this.lastReason = reason;
-    this.score[winner]++;
-    this.money += winner === 'vanguard' ? ECONOMY.winBonus : ECONOMY.lossBonus;
-    this.planted = null;
-    this.planting = null;
-    this.defusing = null;
-    this.emit('roundEnd', { winner, reason, score: { ...this.score } });
-    if (this.score[winner] >= ROUND.winScore || this.round >= ROUND.maxRounds) {
-      this.phase = 'match';
-      this.matchWinner = this.score.vanguard > this.score.sentinel ? 'vanguard'
-        : this.score.sentinel > this.score.vanguard ? 'sentinel' : 'draw';
-      this.emit('matchEnd', { winner: this.matchWinner, score: { ...this.score } });
-    } else {
-      this.phase = 'end';
-      this.timer = ROUND.freezeAfterRound;
-    }
-  }
-
-  nextRound() {
-    this.round++;
+    this.round += 1;
     this.phase = 'buy';
-    this.timer = ROUND.buySeconds;
-    this.emit('buy', { round: this.round });
+    this.phaseTimer = CONFIG.round.buySeconds;
+    this.bombState = 'carried';
+    this.bombSite = null;
+    this.fuseTimer = 0;
+    // Alternate the target site each round so both lanes see play.
+    this.attackSite = this.round % 2 === 1 ? 'A' : 'B';
+    const g = this.game;
+    // Spawn the player and the bots.
+    g.player.reset(SPAWNS.vanguard[0][0], SPAWNS.vanguard[0][1], Math.PI);
+    const vBots = g.bots.filter((b) => b.team === 'vanguard');
+    const sBots = g.bots.filter((b) => b.team === 'sentinel');
+    vBots.forEach((b, i) => {
+      const s = SPAWNS.vanguard[(i + 1) % SPAWNS.vanguard.length];
+      b.reset(s[0], s[1], Math.PI, null);
+      b.chooseObjective(g, this.attackSite);
+    });
+    sBots.forEach((b, i) => {
+      const s = SPAWNS.sentinel[i % SPAWNS.sentinel.length];
+      b.reset(s[0], s[1], 0, [15, 16, 5, 13, 2][i % 5]);
+      b.chooseObjective(g, this.attackSite);
+    });
+    // The carrier is the first Vanguard bot (the player never carries in
+    // round 1's spirit: bots do the planting, the player covers them).
+    this.carrier = vBots[0] || null;
+    g.hud.banner(`ROUND ${this.round} — ${SITES[this.attackSite].name}`, 'Vanguard pushes ' + SITES[this.attackSite].name);
+    g.sounds.roundStart();
   }
 
-  // Planting: a fighter holds E inside a site. Call every tick with the
-  // fighter and the site they stand in (or null). Returns the site when the
-  // plant completes.
-  tickPlant(dt, fighter, siteId) {
-    if (this.phase !== 'live' || this.planted) return null;
-    if (fighter && fighter.team === 'vanguard' && siteId && fighter.alive) {
-      if (!this.planting || this.planting.by !== fighter) {
-        this.planting = { by: fighter, site: siteId, progress: 0 };
-      }
-      this.planting.progress += dt;
-      if (this.planting.progress >= ROUND.plantSeconds) {
-        const site = siteId;
-        this.planted = { site, pos: fighter.pos.clone(), fuse: ROUND.fuseSeconds };
-        this.planting = null;
-        this.money += ECONOMY.plantReward;
-        this.emit('planted', { site });
-        return site;
-      }
-    } else {
-      this.planting = null;
-    }
-    return null;
-  }
-
-  // Defusing: a defender holds E at the planted charge.
-  tickDefuse(dt, fighter, nearCharge) {
-    if (this.phase !== 'live' || !this.planted) return null;
-    if (fighter && fighter.team === 'sentinel' && nearCharge && fighter.alive) {
-      if (!this.defusing || this.defusing.by !== fighter) {
-        this.defusing = { by: fighter, progress: 0 };
-      }
-      this.defusing.progress += dt;
-      if (this.defusing.progress >= ROUND.defuseSeconds) {
-        this.defusing = null;
-        this.endRound('sentinel', 'Charge defused');
-        return true;
-      }
-    } else {
-      this.defusing = null;
-    }
-    return null;
-  }
-
-  // The live-round clock. Call every tick; returns 'timeout' when the round
-  // timer expires, 'detonate' when the fuse burns out.
-  tick(dt) {
+  update(dt) {
+    if (this.matchOver) return;
     if (this.phase === 'buy') {
-      this.timer -= dt;
-      if (this.timer <= 0) this.startRound();
-      return null;
+      this.phaseTimer -= dt;
+      if (this.phaseTimer <= 0) {
+        this.phase = 'live';
+        this.phaseTimer = CONFIG.round.roundSeconds;
+        this.game.hud.banner('GO', 'Plant the charge or clear the yard');
+      }
+      return;
+    }
+    if (this.phase === 'live') {
+      this.phaseTimer -= dt;
+      // If the carrier died, the charge passes to another living Vanguard
+      // fighter — otherwise the bomb is lost with its carrier and Vanguard
+      // can only win by elimination.
+      if (this.bombState === 'carried' && (!this.carrier || !this.carrier.alive)) {
+        const living = this.game.fighters.filter((f) => f.team === 'vanguard' && f.alive);
+        this.carrier = living.length ? living[Math.floor(Math.random() * living.length)] : null;
+        if (this.carrier) this.game.hud.addFeed((this.carrier.name || 'You') + ' picks up the charge');
+      }
+      if (this.bombState === 'planted') {
+        this.fuseTimer -= dt;
+        if (this.fuseTimer <= 0) { this.detonate(); return; }
+      }
+      if (this.phaseTimer <= 0) {
+        // Time out: defenders win unless the bomb is ticking.
+        if (this.bombState !== 'planted') this.endRound('sentinel', 'Time — Sentinel holds the yard');
+        return;
+      }
+      // Elimination check.
+      const vAlive = this.game.fighters.some((f) => f.team === 'vanguard' && f.alive);
+      const sAlive = this.game.fighters.some((f) => f.team === 'sentinel' && f.alive);
+      if (!vAlive) this.endRound('sentinel', 'Vanguard wiped out');
+      else if (!sAlive) this.endRound('vanguard', 'Sentinel wiped out');
+      return;
     }
     if (this.phase === 'end') {
-      this.timer -= dt;
-      if (this.timer <= 0) this.nextRound();
-      return null;
-    }
-    if (this.phase !== 'live') return null;
-    if (this.planted) {
-      this.planted.fuse -= dt;
-      if (this.planted.fuse <= 0) {
-        this.endRound('vanguard', 'Charge detonated');
-        return 'detonate';
+      this.phaseTimer -= dt;
+      if (this.phaseTimer <= 0) {
+        if (this.score.vanguard >= CONFIG.round.winRounds || this.score.sentinel >= CONFIG.round.winRounds || this.round >= CONFIG.round.maxRounds) {
+          this.endMatch();
+        } else {
+          this.startRound();
+        }
       }
-      return null;
-    }
-    this.timer -= dt;
-    if (this.timer <= 0) {
-      this.endRound('sentinel', 'Time expired — no plant');
-      return 'timeout';
-    }
-    return null;
-  }
-
-  // Which site is a fighter standing in, if any? (sites from world.js)
-  siteAt(pos, sites) {
-    for (const [id, s] of Object.entries(sites)) {
-      const dx = pos.x - s.center.x, dz = pos.z - s.center.z;
-      if (dx * dx + dz * dz < s.radius * s.radius) return id;
-    }
-    return null;
-  }
-
-  // How far is a fighter from the planted charge?
-  nearCharge(pos, radius = 2.2) {
-    if (!this.planted) return false;
-    return pos.distanceTo(this.planted.pos) < radius;
-  }
-
-  // Alive counts decide elimination wins; the sim calls this each tick.
-  checkElimination(aliveV, aliveS) {
-    if (this.phase !== 'live') return;
-    if (this.planted) {
-      if (aliveV === 0) this.endRound('sentinel', 'Attackers eliminated');
-    } else {
-      if (aliveV === 0) this.endRound('sentinel', 'Vanguard eliminated');
-      else if (aliveS === 0) this.endRound('vanguard', 'Sentinel eliminated');
     }
   }
-}
 
-// The buy menu's catalogue, shared by the HUD and the sim.
-export function shopItems() {
-  return [
-    { kind: 'weapon', id: 'smg', key: '1', name: WEAPONS.smg.name, price: WEAPONS.smg.price, desc: 'Fast, close-range spray' },
-    { kind: 'weapon', id: 'rifle', key: '2', name: WEAPONS.rifle.name, price: WEAPONS.rifle.price, desc: 'Accurate all-rounder' },
-    { kind: 'weapon', id: 'sniper', key: '3', name: WEAPONS.sniper.name, price: WEAPONS.sniper.price, desc: 'One shot, long range' },
-    { kind: 'armor', id: 'armor', key: '4', name: 'Plate Vest', price: 650, desc: 'Absorbs half of each hit' },
-    { kind: 'grenade', id: 'grenade', key: '5', name: GRENADE.name, price: GRENADE.price, desc: 'Frag — 110 damage in 7 m' },
-    { kind: 'ammo', id: 'ammo', key: '6', name: 'Reserve Ammo', price: 200, desc: 'Refill the current weapon' },
-  ];
+  plantBomb(siteKey, by) {
+    if (this.bombState !== 'carried' || this.phase !== 'live') return;
+    this.bombState = 'planted';
+    this.bombSite = siteKey;
+    this.fuseTimer = CONFIG.round.fuseSeconds;
+    this.game.hud.banner('CHARGE PLANTED — ' + SITES[siteKey].name, 'Defend the charge · 35 s fuse');
+    this.game.hud.addFeed(`${by.name || 'You'} planted the charge at ${siteKey}`);
+    this.game.sounds.plantBeep(true);
+    if (by.money !== undefined) by.money = (by.money || 0) + CONFIG.economy.plantBonus;
+    this.game.onPlant(siteKey);
+  }
+
+  defuseBomb(by) {
+    if (this.bombState !== 'planted') return;
+    this.bombState = 'defused';
+    this.endRound('sentinel', 'Charge defused by ' + (by.name || 'You'));
+  }
+
+  detonate() {
+    this.bombState = 'exploded';
+    this.game.onDetonate(SITES[this.bombSite]);
+    this.endRound('vanguard', 'Charge detonated — ' + SITES[this.bombSite].name + ' is gone');
+  }
+
+  endRound(winnerTeam, reason) {
+    if (this.phase === 'end') return;
+    this.phase = 'end';
+    this.phaseTimer = 4;
+    this.score[winnerTeam] += 1;
+    this.roundLog.push({ round: this.round, winner: winnerTeam, reason });
+    // Pay the economy (bots carry no money; only the player is paid here).
+    const g = this.game;
+    g.player.money += g.player.team === winnerTeam ? CONFIG.economy.winBonus : CONFIG.economy.lossBonus;
+    g.hud.banner(winnerTeam === 'vanguard' ? 'VANGUARD TAKES THE ROUND' : 'SENTINEL TAKES THE ROUND', reason);
+    g.hud.addFeed(reason);
+    g.sounds.roundEnd(g.player.team === winnerTeam);
+  }
+
+  endMatch() {
+    this.matchOver = true;
+    this.phase = 'done';
+    this.winner = this.score.vanguard > this.score.sentinel ? 'vanguard' : 'sentinel';
+    const g = this.game;
+    g.hud.showMatchEnd(this.winner, this.score, g.player.kills);
+    g.sounds.roundEnd(g.player.team === this.winner);
+  }
 }

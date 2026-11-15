@@ -1,98 +1,83 @@
-// RUSTLINE — procedural sound. Every sound is synthesized with WebAudio:
-// no audio files, no network. A tiny synth per event, kept quiet and short.
+// RUSTLINE — synthesized sound: every effect is built with WebAudio, no assets.
+// The context is created lazily on the first user gesture; in headless smoke
+// runs it simply stays silent.
 
 export class SoundBank {
   constructor() {
     this.ctx = null;
     this.master = null;
-    this.enabled = true;
+    this.noiseBuf = null;
   }
 
   ensure() {
-    if (this.ctx) return;
+    if (this.ctx) return true;
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return false;
       this.ctx = new AC();
       this.master = this.ctx.createGain();
       this.master.gain.value = 0.5;
       this.master.connect(this.ctx.destination);
-    } catch (e) {
-      this.ctx = null;
-    }
+      const len = this.ctx.sampleRate;
+      this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const d = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    } catch (e) { return false; }
+    return true;
   }
 
-  resume() {
-    this.ensure();
-    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
-  }
-
-  // Short filtered noise burst: the body of every gunshot and explosion.
-  noise(dur, filterFreq, gain, type = 'lowpass') {
-    if (!this.ctx || !this.enabled) return;
-    const t = this.ctx.currentTime;
-    const len = Math.max(1, Math.floor(this.ctx.sampleRate * dur));
-    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  // A short burst of filtered noise with an exponential decay.
+  burst(freq, dur, gain, type = 'lowpass', when = 0) {
+    if (!this.ensure()) return;
+    const t = this.ctx.currentTime + when;
     const src = this.ctx.createBufferSource();
-    src.buffer = buf;
+    src.buffer = this.noiseBuf;
+    src.loop = true;
     const f = this.ctx.createBiquadFilter();
-    f.type = type; f.frequency.value = filterFreq;
+    f.type = type; f.frequency.value = freq;
     const g = this.ctx.createGain();
     g.gain.setValueAtTime(gain, t);
     g.gain.exponentialRampToValueAtTime(0.001, t + dur);
     src.connect(f); f.connect(g); g.connect(this.master);
-    src.start(t);
+    src.start(t); src.stop(t + dur + 0.05);
   }
 
-  // A pure tone with a fast pitch drop: thumps, beeps and dings.
-  tone(freq, dur, gain, slideTo = null, type = 'sine') {
-    if (!this.ctx || !this.enabled) return;
-    const t = this.ctx.currentTime;
+  // A pure tone with a pitch slide, for beeps and the explosion's body.
+  tone(freq0, freq1, dur, gain, type = 'sine', when = 0) {
+    if (!this.ensure()) return;
+    const t = this.ctx.currentTime + when;
     const o = this.ctx.createOscillator();
-    o.type = type; o.frequency.setValueAtTime(freq, t);
-    if (slideTo !== null) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    o.type = type;
+    o.frequency.setValueAtTime(freq0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, freq1), t + dur);
     const g = this.ctx.createGain();
     g.gain.setValueAtTime(gain, t);
     g.gain.exponentialRampToValueAtTime(0.001, t + dur);
     o.connect(g); g.connect(this.master);
-    o.start(t); o.stop(t + dur + 0.02);
+    o.start(t); o.stop(t + dur + 0.05);
   }
 
-  // distance: 0 = at the listener, 1 = far. Far sounds get quieter and duller.
-  shot(kind, distance = 0) {
-    this.resume();
-    const att = Math.max(0.15, 1 - distance * 0.75);
-    if (kind === 'pistol') { this.noise(0.09, 2400, 0.5 * att); this.tone(180, 0.07, 0.25 * att, 70, 'square'); }
-    else if (kind === 'smg') { this.noise(0.07, 3000, 0.38 * att); this.tone(220, 0.05, 0.18 * att, 90, 'square'); }
-    else if (kind === 'rifle') { this.noise(0.11, 1900, 0.6 * att); this.tone(140, 0.09, 0.3 * att, 55, 'square'); }
-    else if (kind === 'sniper') { this.noise(0.22, 1200, 0.85 * att); this.tone(110, 0.18, 0.4 * att, 40, 'sawtooth'); }
+  shot(kind) {
+    if (kind === 'longbow') { this.burst(900, 0.32, 0.9); this.tone(140, 40, 0.3, 0.7, 'sawtooth'); }
+    else if (kind === 'ar77') { this.burst(2400, 0.11, 0.55); this.tone(220, 90, 0.09, 0.4, 'square'); }
+    else if (kind === 'vex9') { this.burst(3200, 0.08, 0.42); }
+    else { this.burst(1800, 0.1, 0.5); this.tone(180, 70, 0.08, 0.35, 'square'); }
   }
 
-  dryFire() { this.tone(1200, 0.03, 0.12, null, 'square'); }
-  reload() {
-    this.tone(900, 0.03, 0.15, null, 'square');
-    setTimeout(() => this.tone(600, 0.03, 0.15, null, 'square'), 140);
-    setTimeout(() => this.tone(1100, 0.03, 0.18, null, 'square'), 320);
+  dryFire() { this.tone(1200, 900, 0.05, 0.2, 'square'); }
+  reload() { this.burst(5000, 0.05, 0.25, 'highpass'); this.burst(3500, 0.05, 0.2, 'highpass', 0.35); }
+  hit() { this.tone(1800, 1800, 0.05, 0.3, 'sine'); }
+  hurt() { this.tone(140, 60, 0.18, 0.5, 'sawtooth'); }
+  step() { this.burst(700, 0.06, 0.12); }
+  plantBeep(final) { this.tone(final ? 1400 : 950, final ? 1400 : 950, final ? 0.4 : 0.12, 0.4, 'sine'); }
+  explosion() {
+    this.burst(300, 1.1, 1.0);
+    this.tone(90, 28, 1.0, 0.9, 'sine');
+    this.burst(5000, 0.25, 0.5, 'highpass');
   }
-  hit(head = false) { this.tone(head ? 2400 : 1700, 0.05, 0.22, null, 'sine'); }
-  hurt() { this.noise(0.12, 500, 0.3); this.tone(90, 0.14, 0.25, 50, 'sine'); }
-  kill() { this.tone(880, 0.08, 0.2); setTimeout(() => this.tone(1320, 0.12, 0.2), 80); }
-  explosion(distance = 0) {
-    const att = Math.max(0.2, 1 - distance * 0.6);
-    this.noise(0.7, 400, 0.9 * att);
-    this.tone(70, 0.6, 0.5 * att, 28, 'sine');
+  roundStart() { this.tone(520, 780, 0.16, 0.3, 'sine'); this.tone(780, 780, 0.22, 0.3, 'sine', 0.18); }
+  roundEnd(win) {
+    if (win) { this.tone(520, 520, 0.14, 0.3, 'sine'); this.tone(660, 660, 0.14, 0.3, 'sine', 0.15); this.tone(880, 880, 0.3, 0.3, 'sine', 0.3); }
+    else { this.tone(420, 320, 0.3, 0.3, 'sine'); this.tone(320, 240, 0.4, 0.3, 'sine', 0.2); }
   }
-  plantBeep() { this.tone(1500, 0.06, 0.2); }
-  defuseBeep() { this.tone(1100, 0.06, 0.2); }
-  roundWin() {
-    [523, 659, 784].forEach((f, i) => setTimeout(() => this.tone(f, 0.16, 0.22), i * 110));
-  }
-  roundLose() {
-    [392, 330, 262].forEach((f, i) => setTimeout(() => this.tone(f, 0.18, 0.2), i * 130));
-  }
-  buy() { this.tone(1000, 0.05, 0.18); setTimeout(() => this.tone(1400, 0.06, 0.18), 60); }
-  denied() { this.tone(220, 0.12, 0.2, 180, 'square'); }
-  step() { this.noise(0.04, 700, 0.06); }
-  grenadePin() { this.tone(2000, 0.03, 0.12, null, 'square'); }
 }

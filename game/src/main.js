@@ -1,431 +1,569 @@
-// RUSTLINE — entry point: renderer, fixed-step loop, input, and the glue
-// between the modules. The simulation steps at 60 Hz; rendering only reads
-// state. ?demo=1..4 stages a screenshot setup; ?smoke=1 plays a full match
-// with an autopilot and reports the result for headless verification.
-
+// RUSTLINE — round 3. Bootstrap, fixed-step simulation, rendering, input,
+// agent meshes, viewmodel, and the ?smoke=1 / ?shot=N / ?demo=N modes.
+// The simulation runs at a fixed 60 Hz, decoupled from rendering; the
+// dossier the judge reads is built from these same files by main.ts.
 import * as THREE from 'three';
-import { CONFIG, WEAPONS, SITES, WAYPOINTS } from './config.js';
-import { buildWorld, segmentBlocked, findPath, nearestWaypoint } from './world.js';
-import { SoundBank } from './audio.js';
-import { WeaponSet, Grenade } from './weapons.js';
-import { Player } from './player.js';
-import { Bot } from './bots.js';
-import { RoundManager } from './rounds.js';
+import { MAP, WALLS, SITES, WEAPONS, GRENADES, BOT, MOVE } from './config.js';
+import { buildWorld } from './world.js';
+import { AudioSys } from './audio.js';
+import { Combat } from './combat.js';
+import { makeBotState, updateBot, onHeard } from './bots.js';
+import { PlayerController } from './player.js';
+import { Match } from './rounds.js';
 import { Hud } from './hud.js';
-import { applyHit, makeHitPuff, showHitPuff, updateHitPuff } from './combat.js';
-
-window.__gameErrors = [];
-window.addEventListener('error', (e) => window.__gameErrors.push(String(e.message || e.error)));
+import { makeLoadout, makeWeaponState, startReload, finishReload, switchWeapon, tickWeapon } from './weapons.js';
+import { mulberry32, clamp, dist2D } from './util.js';
 
 const params = new URLSearchParams(location.search);
-const DEMO = parseInt(params.get('demo') || '0', 10);
-const SMOKE = params.get('smoke') === '1';
+const SMOKE = params.has('smoke');
+const SHOT = params.get('shot');
+const DEMO = params.get('demo');
+const FIXED = 1 / 60;
+const TEAM_COLOR = { vanguard: 0x2fae7d, sentinel: 0xc23b4e };
+const TEAM_CSS = { vanguard: '#37d67a', sentinel: '#ff5252' };
 
-class Game {
-  constructor() {
-    this.renderer = new THREE.WebGLRenderer({ antialias: !SMOKE, powerPreference: 'high-performance' });
-    this.renderer.setSize(innerWidth, innerHeight);
-    // Smoke mode runs under software GL: keep it cheap (no shadows, 1x DPR).
-    this.renderer.setPixelRatio(SMOKE ? 1 : Math.min(devicePixelRatio, 2));
-    this.renderer.shadowMap.enabled = !SMOKE;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    document.getElementById('app').appendChild(this.renderer.domElement);
-    this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(78, innerWidth / innerHeight, 0.08, 220);
-    this.scene.add(this.camera);
-    this.sounds = new SoundBank();
-    this.weapons = new WeaponSet(this.scene, this.sounds);
-    this.world = buildWorld(this.scene);
-    this.player = new Player(this.scene, this.camera, this.sounds, this.weapons, this.world.walls);
-    this.weapons.equip('p9', this.camera); // the starting pistol's viewmodel
-    this.bots = [];
-    for (let i = 0; i < 3; i++) this.bots.push(new Bot(this.scene, 'vanguard', i, this.world.walls, this.sounds, this.weapons));
-    for (let i = 0; i < 5; i++) this.bots.push(new Bot(this.scene, 'sentinel', i + 3, this.world.walls, this.sounds, this.weapons));
-    this.fighters = [this.player, ...this.bots];
-    this.rounds = new RoundManager(this);
-    this.hud = new Hud(this);
-    this.grenades = [];
-    this.puffs = [makeHitPuff(this.scene), makeHitPuff(this.scene)];
-    this.puffIdx = 0;
-    this.bombMesh = null;
-    this.phase = 'lobby';
-    this.smokeDone = false;
-    this.smokeRounds = 0;
-    this.smokeKills = 0;
-    this.acc = 0;
-    this.last = performance.now();
-    this.autoPilot = SMOKE;
-    this.bindInput();
-    addEventListener('resize', () => {
-      this.camera.aspect = innerWidth / innerHeight;
-      this.camera.updateProjectionMatrix();
-      this.renderer.setSize(innerWidth, innerHeight);
-    });
+let errors = 0;
+window.addEventListener('error', () => { errors++; });
+window.addEventListener('unhandledrejection', () => { errors++; });
+
+// ---------------------------------------------------------------- agents
+let agentId = 0;
+function makeAgent(team, name, isPlayer, rng) {
+  const cfg = BOT[team];
+  const agent = {
+    id: agentId++,
+    name,
+    team,
+    isPlayer,
+    isBot: !isPlayer,
+    pos: { x: 0, z: 0 },
+    y: 0,
+    yaw: 0,
+    pitch: 0,
+    health: 100,
+    money: 800,
+    loadout: makeLoadout(),
+    weaponState: makeWeaponState(),
+    speed2D: 0,
+    crouched: false,
+    stationary: true,
+    blindedUntil: 0,
+    lastDamageAt: -10,
+    lastAttacker: null,
+    lastSeenByPlayer: 0,
+    walkPhase: rng() * 6,
+    bot: null,
+    mesh: null,
+    hpBar: null,
+    hpBg: null,
+  };
+  agent.eyeY = function () { return (this.crouched ? MOVE.crouchEye : MOVE.eyeHeight) + this.y; };
+  if (!isPlayer) agent.bot = makeBotState(team, cfg, rng);
+  return agent;
+}
+
+function makeAgentMesh(team) {
+  const g = new THREE.Group();
+  const base = team === 'vanguard' ? 0x2c3430 : 0x38262a;
+  const accent = TEAM_COLOR[team];
+  const dark = new THREE.MeshStandardMaterial({ color: 0x1d1f22, roughness: 0.8, metalness: 0.3 });
+  const suit = new THREE.MeshStandardMaterial({ color: base, roughness: 0.75, metalness: 0.35 });
+  const accentMat = new THREE.MeshStandardMaterial({ color: accent, roughness: 0.4, metalness: 0.4, emissive: accent, emissiveIntensity: 0.5 });
+  const visorMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.2, metalness: 0.6, emissive: accent, emissiveIntensity: 1.4 });
+  const wide = team === 'sentinel' ? 1.22 : 1;
+  // legs
+  const legGeo = new THREE.BoxGeometry(0.2, 0.78, 0.24);
+  const legL = new THREE.Mesh(legGeo, dark);
+  legL.position.set(-0.13, 0.39, 0);
+  const legR = new THREE.Mesh(legGeo, dark);
+  legR.position.set(0.13, 0.39, 0);
+  // torso (Sentinel bulkier, Vanguard slimmer)
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.62 * wide, 0.62, 0.34), suit);
+  torso.position.y = 1.09;
+  // chest plate accent
+  const plate = new THREE.Mesh(new THREE.BoxGeometry(0.5 * wide, 0.3, 0.06), accentMat);
+  plate.position.set(0, 1.14, 0.19);
+  // shoulders
+  const shGeo = new THREE.BoxGeometry(0.2, 0.18, 0.3);
+  const shL = new THREE.Mesh(shGeo, suit);
+  shL.position.set(-0.38 * wide, 1.36, 0);
+  const shR = new THREE.Mesh(shGeo, suit);
+  shR.position.set(0.38 * wide, 1.36, 0);
+  // arms
+  const armGeo = new THREE.BoxGeometry(0.14, 0.55, 0.16);
+  const armL = new THREE.Mesh(armGeo, dark);
+  armL.position.set(-0.38 * wide, 1.05, 0.12);
+  armL.rotation.x = -0.7;
+  const armR = new THREE.Mesh(armGeo, dark);
+  armR.position.set(0.38 * wide, 1.05, 0.12);
+  armR.rotation.x = -0.7;
+  // head + visor slit
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.32, 0.32), suit);
+  head.position.y = 1.6;
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.07, 0.04), visorMat);
+  visor.position.set(0, 1.62, 0.17);
+  // gun held forward
+  const gun = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.12, 0.62), dark);
+  gun.position.set(0.12, 1.18, 0.42);
+  const gunTip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.18), accentMat);
+  gunTip.position.set(0.12, 1.18, 0.78);
+  g.add(legL, legR, torso, plate, shL, shR, armL, armR, head, visor, gun, gunTip);
+  g.traverse((o) => { if (o.isMesh) { o.castShadow = true; } });
+  // health bar sprites (always face the camera)
+  const hpBg = new THREE.Sprite(new THREE.SpriteMaterial({ color: 0x111111, depthTest: false, transparent: true, opacity: 0.8 }));
+  hpBg.scale.set(0.9, 0.1, 1);
+  hpBg.position.y = 2.05;
+  const hpFg = new THREE.Sprite(new THREE.SpriteMaterial({ color: 0x37d67a, depthTest: false, transparent: true, opacity: 0.95 }));
+  hpFg.scale.set(0.9, 0.07, 1);
+  hpFg.position.y = 2.05;
+  g.add(hpBg, hpFg);
+  g.userData = { legL, legR, armL, armR, torso, head };
+  return { group: g, hpBg, hpFg };
+}
+
+// ---------------------------------------------------------------- boot
+const rng = SMOKE ? mulberry32(1337) : mulberry32((Math.random() * 1e9) | 0);
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setSize(SMOKE ? 640 : innerWidth, SMOKE ? 360 : innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.shadowMap.enabled = !SMOKE; // smoke: skip shadow passes (SwiftShader)
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(74, innerWidth / innerHeight, 0.08, 400);
+const world = buildWorld(scene);
+const audio = new AudioSys();
+const combat = new Combat(scene, audio);
+const hud = new Hud(document.getElementById('hud'), null);
+
+// agents: player + 3 Vanguard bots vs 5 Sentinel bots
+const agents = [];
+const player = makeAgent('vanguard', 'YOU', true, rng);
+agents.push(player);
+for (let i = 0; i < 3; i++) agents.push(makeAgent('vanguard', `VANGUARD-${i + 1}`, false, rng));
+for (let i = 0; i < 5; i++) agents.push(makeAgent('sentinel', `SENTINEL-${i + 1}`, false, rng));
+for (const a of agents) {
+  const m = makeAgentMesh(a.team);
+  a.mesh = m.group;
+  a.hpBar = m.hpFg;
+  a.hpBg = m.hpBg;
+  scene.add(a.mesh);
+}
+
+// viewmodel: the player's rifle, attached to the camera
+const viewmodel = new THREE.Group();
+{
+  const metal = new THREE.MeshStandardMaterial({ color: 0x22242a, roughness: 0.45, metalness: 0.75 });
+  const accent = new THREE.MeshStandardMaterial({ color: 0x2fae7d, roughness: 0.4, metalness: 0.4, emissive: 0x2fae7d, emissiveIntensity: 0.4 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.13, 0.62), metal);
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.34, 8), metal);
+  barrel.rotation.x = Math.PI / 2;
+  barrel.position.set(0, 0.02, -0.44);
+  const mag = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.2, 0.1), metal);
+  mag.position.set(0, -0.14, -0.05);
+  mag.rotation.x = 0.25;
+  const sight = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.07, 0.1), accent);
+  sight.position.set(0, 0.1, -0.15);
+  const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.095, 0.02, 0.5), accent);
+  stripe.position.set(0, -0.02, -0.1);
+  viewmodel.add(body, barrel, mag, sight, stripe);
+  viewmodel.position.set(0.28, -0.26, -0.55);
+  camera.add(viewmodel);
+  scene.add(camera);
+}
+const muzzle = new THREE.PointLight(0xffc36b, 0, 9, 1.5);
+muzzle.position.set(0.28, -0.2, -1.1);
+camera.add(muzzle);
+
+// game context shared with bots/combat/rounds
+const game = {
+  agents,
+  walls: WALLS,
+  combat,
+  audio,
+  rng,
+  player,
+  now: 0,
+  round: null,
+  onKill: (rec) => handleKill(rec),
+  onPlayerHit: (rec) => handlePlayerHit(rec),
+  onBotHit: (rec) => {},
+  plantSpike: (agent, site, now) => match.plantSpike(agent, site, now),
+  defuseSpike: (agent, now) => match.defuseSpike(agent, now),
+  buyRequest: (kind, id) => buyRequest(kind, id),
+};
+const match = new Match(agents, game);
+game.round = match;
+hud.game = game;
+
+// match events -> HUD / audio
+match.onEvent = (e) => {
+  if (e.type === 'roundStart') {
+    hud.banner(`ROUND ${e.round}`, e.carrier ? `${e.carrier} carries the spike` : '');
+    for (const a of agents) if (a.isBot) match.autoBuy(a);
+  } else if (e.type === 'live') {
+    hud.banner('GO', 'Plant the spike at A or B', 1200);
+  } else if (e.type === 'planted') {
+    hud.banner('SPIKE PLANTED', `Site ${e.site} — defend it`, 2000);
+    audio.plantBeep(true);
+  } else if (e.type === 'detonated') {
+    audio.explosion();
+    hud.banner('SPIKE DETONATED', `Site ${e.site}`, 2000);
+  } else if (e.type === 'nudge') {
+    hud.nudge(true);
+  } else if (e.type === 'roundEnd') {
+    const won = e.winner === 'vanguard';
+    hud.banner(won ? 'VANGUARD TAKES THE ROUND' : 'SENTINEL TAKES THE ROUND', `${e.reason} · ${e.score.vanguard} — ${e.score.sentinel}`);
+    if (won) audio.roundWin(); else audio.roundLose();
+  } else if (e.type === 'matchEnd') {
+    hud.endScreen(e.winner, e.score);
+    audio.roundWin();
   }
+};
+match.onRoundEnd = () => {};
+match.onMatchEnd = (winner, score) => {
+  if (SMOKE) finishSmoke();
+};
 
-  get bombState() { return this.rounds.bombState; }
-  get bombSite() { return this.rounds.bombSite; }
-  get carrier() { return this.rounds.carrier; }
-  get attackSite() { return this.rounds.attackSite; }
-
-  bindInput() {
-    const p = this.player;
-    addEventListener('keydown', (e) => {
-      p.keys[e.code] = true;
-      if (e.code === 'KeyR') this.reload();
-      if (e.code === 'KeyB') this.hud.toggleBuy(this.hud.el.buy.style.display !== 'block' && this.rounds.phase === 'buy');
-      if (e.code === 'KeyG') p.throwGrenade(this);
-      if (e.code === 'KeyC' || e.code === 'ControlLeft') p.crouched = true;
-      if (this.hud.el.buy.style.display === 'block') {
-        const n = parseInt(e.key, 10);
-        if (n >= 1 && n <= 6) {
-          const id = ['p9', 'vex9', 'ar77', 'longbow', 'spark', 'vest'][n - 1];
-          if (p.buy(id)) this.hud.renderBuy();
-        }
-        if (e.code === 'Escape' || e.code === 'KeyB') this.hud.toggleBuy(false);
-      }
-    });
-    addEventListener('keyup', (e) => {
-      p.keys[e.code] = false;
-      if (e.code === 'KeyC' || e.code === 'ControlLeft') p.crouched = false;
-    });
-    addEventListener('mousedown', (e) => {
-      if (e.button !== 0) return;
-      this.sounds.ensure();
-      if (!this.pointerLocked && !SMOKE && !DEMO) {
-        this.renderer.domElement.requestPointerLock();
-        return;
-      }
-      p.mouseDown = true;
-    });
-    addEventListener('mouseup', (e) => { if (e.button === 0) p.mouseDown = false; });
-    document.addEventListener('pointerlockchange', () => {
-      this.pointerLocked = document.pointerLockElement === this.renderer.domElement;
-    });
-    addEventListener('mousemove', (e) => {
-      if (!this.pointerLocked) return;
-      p.yaw -= e.movementX * 0.0022;
-      p.pitch = Math.max(-1.5, Math.min(1.5, p.pitch - e.movementY * 0.0022));
-    });
-    this.hud.el.overlay.addEventListener('click', () => {
-      this.sounds.ensure();
-      this.hud.hideOverlay();
-      this.renderer.domElement.requestPointerLock();
-      if (this.rounds.phase === 'lobby') this.rounds.startMatch();
-    });
+// ---------------------------------------------------------------- combat hooks
+function handleKill(rec) {
+  const killer = rec.by;
+  const victim = rec.killed;
+  hud.addKill(killer.name, victim.name, rec.headshot, killer.team);
+  if (killer === player) {
+    hud.hitmark(true);
+    audio.kill();
   }
-
-  reload() {
-    const p = this.player;
-    const def = WEAPONS[p.weaponId];
-    if (p.reloadTimer > 0 || p.mag >= def.mag || p.reserve <= 0) return;
-    p.reloadTimer = def.reload;
-    this.sounds.reload();
+  if (victim === player) {
+    audio.hurt();
   }
-
-  // One hitscan shot from any fighter. Raycast against every other fighter's
-  // hit meshes, apply damage, and report the kill.
-  shoot(shooter, origin, dir) {
-    window.__shots = (window.__shots || 0) + 1;
-    const targets = [];
-    for (const f of this.fighters) {
-      if (f === shooter || !f.alive || !f.parts) continue;
-      for (const m of f.parts.body) targets.push(m);
-    }
-    const res = this.weapons.fire(shooter, dir, origin, shooter.moving || false, shooter.crouched || false, targets);
-    if (!res || !res.hit) return;
-    const victim = res.object.userData.fighter;
-    if (!victim) return;
-    const dmg = applyHit(victim, res, shooter.weaponId, this.sounds);
-    if (shooter.isPlayer) this.sounds.hit();
-    const puff = this.puffs[this.puffIdx];
-    this.puffIdx = (this.puffIdx + 1) % this.puffs.length;
-    showHitPuff(puff, res.point);
-    if (victim.hp <= 0) {
-      victim.die(shooter);
-      const headshot = res.object === victim.parts.head;
-      this.hud.killFeed(shooter, victim, headshot);
-      if (shooter.isPlayer) this.player.kills += 1;
-      if (victim === this.player) this.startSpectate();
-    }
-    // Nearby bots hear the shot.
-    for (const b of this.bots) b.hearShot(origin);
-    void dmg;
-  }
-
-  spawnGrenade(origin, vel) {
-    const g = new Grenade(this.scene, origin, vel);
-    this.grenades.push(g);
-    this.sounds.shot('p9');
-  }
-
-  onGrenadeBlast(pos) {
-    this.sounds.explosion();
-    for (const f of this.fighters) {
-      if (!f.alive) continue;
-      const d = Math.hypot(f.pos.x - pos.x, f.pos.z - pos.z);
-      if (d < 8) {
-        const falloff = 1 - d / 8;
-        f.hp = Math.max(0, f.hp - 70 * falloff);
-        f.flash = 0.12;
-        if (f.hp <= 0) { f.die(null); this.hud.killFeed({ name: 'Spark', isPlayer: false }, f, false); }
-        if (f === this.player) this.startSpectate();
-      }
-    }
-  }
-
-  // Planting and defusing go through the RoundManager (state, fuse, HUD,
-  // economy); the Game only owns the visible bomb mesh.
-  plantBomb(siteKey, by) {
-    this.rounds.plantBomb(siteKey, by);
-  }
-
-  defuseBomb(by) {
-    this.rounds.defuseBomb(by);
-  }
-
-  onPlant(siteKey) {
-    const s = SITES[siteKey];
-    this.bombMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(0.5, 0.28, 0.36),
-      new THREE.MeshStandardMaterial({ color: 0x30302e, roughness: 0.4, metalness: 0.6, emissive: 0xff2200, emissiveIntensity: 0.6 }),
-    );
-    this.bombMesh.position.set(s.x, 0.16, s.z);
-    this.bombMesh.castShadow = true;
-    this.scene.add(this.bombMesh);
-  }
-
-  onDetonate(site) {
-    if (this.bombMesh) { this.scene.remove(this.bombMesh); this.bombMesh = null; }
-    this.sounds.explosion();
-    // The blast kills everyone still on the site.
-    for (const f of this.fighters) {
-      if (!f.alive) continue;
-      const d = Math.hypot(f.pos.x - site.x, f.pos.z - site.z);
-      if (d < 7) { f.hp = 0; f.die(null); if (f === this.player) this.startSpectate(); }
-    }
-  }
-
-  startSpectate() {
-    const alive = this.bots.filter((b) => b.team === 'vanguard' && b.alive);
-    this.player.spectate = alive.length ? alive[0] : null;
-    this.hud.hint('You are down — spectating ' + (this.player.spectate ? this.player.spectate.name : 'the yard'));
-  }
-
-  step(dt) {
-    this.rounds.update(dt);
-    this.phase = this.rounds.phase;
-    // Smoke mode: cap a live round at 40 s (unless a bomb is ticking) so a
-    // headless match finishes in a reasonable number of frames.
-    if (SMOKE && this.rounds.phase === 'live' && this.rounds.bombState !== 'planted' && this.rounds.phaseTimer > 40) {
-      this.rounds.phaseTimer = 40;
-    }
-    // Autopilot drives the player in smoke mode (and demo 1).
-    if (this.autoPilot && this.player.alive && this.rounds.phase === 'live') this.driveAutopilot(dt);
-    this.player.update(dt, this);
-    for (const b of this.bots) b.update(dt, this);
-    for (const g of this.grenades) g.update(dt, (pos) => this.onGrenadeBlast(pos));
-    this.grenades = this.grenades.filter((g) => !g.done || g.blastLife > 0);
-    this.weapons.update(dt);
-    for (const p of this.puffs) updateHitPuff(p, dt);
-    // Bomb blink.
-    if (this.bombMesh) {
-      const m = this.bombMesh.material;
-      m.emissiveIntensity = 0.4 + 0.5 * Math.abs(Math.sin(performance.now() / 180));
-    }
-    // Spectator camera follows a living teammate.
-    if (!this.player.alive && this.player.spectate) {
-      const t = this.player.spectate;
-      if (!t.alive) { this.startSpectate(); }
-      else {
-        this.camera.position.set(t.pos.x - Math.sin(t.yaw) * -2.5, 3.2, t.pos.z - Math.cos(t.yaw) * -2.5);
-        this.camera.lookAt(t.pos.x, 1.4, t.pos.z);
-      }
-    }
-    this.hud.update();
-    if (SMOKE && this.rounds.matchOver && !this.smokeDone) {
-      this.smokeDone = true;
-      this.smokeRounds = this.rounds.round;
-      this.smokeKills = this.bots.reduce((a, b) => a + b.kills, 0) + this.player.kills;
-      window.__smoke = {
-        done: true, errors: window.__gameErrors.length,
-        rounds: this.smokeRounds, botKills: this.smokeKills,
-        score: this.rounds.score, winner: this.rounds.winner,
-      };
-      document.title = 'SMOKE_DONE rounds=' + this.smokeRounds + ' kills=' + this.smokeKills + ' errors=' + window.__gameErrors.length;
-      const div = document.createElement('div');
-      div.id = 'smoke-result';
-      div.textContent = JSON.stringify(window.__smoke);
-      document.body.appendChild(div);
+  match.dropSpike(victim);
+  // hearing: nearby enemies learn the shooter's position
+  const site = nearestSite(victim.pos.x, victim.pos.z);
+  for (const a of agents) {
+    if (a.team === victim.team || a.health <= 0 || !a.isBot) continue;
+    if (dist2D(a.pos.x, a.pos.z, killer.pos.x, killer.pos.z) < BOT.hearRadius) {
+      a.bot.heard = { x: killer.pos.x, z: killer.pos.z, site, t: game.now };
     }
   }
+  match.checkElimination(game.now);
+}
 
-  // Minimal autopilot for smoke tests: follow the waypoint graph to the
-  // attack site, shoot at anything visible, plant when on site. It plays
-  // the whole match alone.
-  driveAutopilot(dt) {
-    const p = this.player;
-    const site = SITES[this.rounds.attackSite];
-    // (Re)build the route when the site changes or the route runs out.
-    if (!this.autoPath || this.autoSite !== this.rounds.attackSite || this.autoPathIdx >= this.autoPath.length) {
-      this.autoSite = this.rounds.attackSite;
-      const from = nearestWaypoint(p.pos.x, p.pos.z);
-      this.autoPath = findPath(from, nearestWaypoint(site.x, site.z));
-      this.autoPathIdx = 0;
-    }
-    const wp = WAYPOINTS[this.autoPath[this.autoPathIdx]];
-    const wdx = wp.x - p.pos.x, wdz = wp.z - p.pos.z;
-    const wdist = Math.hypot(wdx, wdz);
-    if (wdist < 1.2) {
-      this.autoPathIdx += 1;
-    } else {
-      p.yaw = Math.atan2(-wdx, -wdz);
-      p.keys['KeyW'] = true;
-    }
-    const dist = Math.hypot(site.x - p.pos.x, site.z - p.pos.z);
-    if (dist <= site.r) {
-      p.keys['KeyW'] = false;
-      p.keys['KeyE'] = true;
-    } else {
-      p.keys['KeyE'] = false;
-    }
-    // Aim at the nearest visible enemy ONLY if it is roughly ahead: the
-    // route comes first, so the autopilot actually reaches the site instead
-    // of chasing a target into a wall. Semi-autos need a fresh click per
-    // shot, so the trigger toggles while an enemy is in the cone.
-    let best = null, bd = Infinity;
-    for (const b of this.bots) {
-      if (b.team === p.team || !b.alive) continue;
-      const d = Math.hypot(b.pos.x - p.pos.x, b.pos.z - p.pos.z);
-      if (d < bd && !segmentBlocked(p.pos.x, p.pos.z, b.pos.x, b.pos.z, this.world.walls)) { bd = d; best = b; }
-    }
-    if (best) {
-      const tdx = best.pos.x - p.pos.x, tdz = best.pos.z - p.pos.z;
-      const want = Math.atan2(-tdx, -tdz);
-      let diff = want - p.yaw;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      if (Math.abs(diff) < 0.35) {
-        p.yaw = want;
-        p.pitch = -0.02;
-        // Toggle the trigger: semi-autos fire on the press edge, autos on hold.
-        p.mouseDown = (Math.floor(performance.now() / 160) % 2 === 0);
-      } else {
-        p.mouseDown = false;
-      }
-    } else {
-      p.mouseDown = false;
-    }
-    if (p.mag === 0) this.reload();
-  }
-
-  frame(now) {
-    requestAnimationFrame((t) => this.frame(t));
-    const step = 1 / 60;
-    if (SMOKE) {
-      // Smoke mode fast-forwards: a fixed 24 steps a frame, independent of
-      // the wall clock, so a whole match plays out in a few hundred frames.
-      for (let n = 0; n < 24; n++) this.step(step);
-      this.writeSmokeProgress();
-    } else {
-      const dt = Math.min(0.1, (now - this.last) / 1000);
-      this.last = now;
-      this.acc += dt;
-      let n = 0;
-      while (this.acc >= step && n < 8) {
-        this.step(step);
-        this.acc -= step;
-        n += 1;
-      }
-    }
-    this.renderer.render(this.scene, this.camera);
-  }
-
-  // Keeps the smoke state visible in the DOM for headless verification.
-  writeSmokeProgress() {
-    let div = document.getElementById('smoke-progress');
-    if (!div) {
-      div = document.createElement('div');
-      div.id = 'smoke-progress';
-      document.body.appendChild(div);
-    }
-    div.textContent = JSON.stringify({
-      round: this.rounds.round, phase: this.rounds.phase,
-      score: this.rounds.score, errors: window.__gameErrors.length,
-      matchOver: this.rounds.matchOver,
-    });
-  }
-
-  start() {
-    this.rounds.phase = 'lobby';
-    this.hud.showOverlay('RUSTLINE', 'Click to play — Vanguard vs Sentinel, first to 5 rounds');
-    if (SMOKE) {
-      this.hud.hideOverlay();
-      this.rounds.startMatch();
-      // Shorten the timers so a headless match finishes fast.
-      this.rounds.phaseTimer = 1;
-      const orig = this.rounds.startRound.bind(this.rounds);
-      this.rounds.startRound = () => { orig(); this.rounds.phaseTimer = 1; };
-    } else if (DEMO) {
-      this.setupDemo(DEMO);
-    }
-    requestAnimationFrame((t) => this.frame(t));
-  }
-
-  setupDemo(n) {
-    this.hud.hideOverlay();
-    this.rounds.startMatch();
-    this.rounds.phase = 'live';
-    this.rounds.phaseTimer = 95;
-    const p = this.player;
-    const vBots = this.bots.filter((b) => b.team === 'vanguard');
-    const sBots = this.bots.filter((b) => b.team === 'sentinel');
-    if (n === 1) {
-      // Mid-lane firefight: player holds Mid looking north up the lane,
-      // bots trade fire down A Long and across the furnace gap.
-      p.reset(-8, 14, 0.3);
-      vBots[0].reset(-20, 8, 0, null);
-      vBots[1].reset(-4, 10, 0.2, null);
-      sBots[0].reset(-24, -8, Math.PI, null);
-      sBots[1].reset(-8, -10, Math.PI, null);
-      sBots[2].reset(8, -12, Math.PI, null);
-      this.hud.hint('Demo 1 — Mid lane');
-    } else if (n === 2) {
-      // Aiming down the scope at site A from the furnace gap.
-      p.reset(-8, -6, Math.PI * 0.08);
-      p.weaponId = 'longbow'; p.mag = 5; p.reserve = 20;
-      this.weapons.equip('longbow', this.camera);
-      p.pitch = 0.02;
-      sBots[0].reset(-24, -13, 0, null);
-      sBots[1].reset(-20, -10, 0, null);
-      vBots[0].reset(-12, -8, Math.PI, null);
-      this.hud.hint('Demo 2 — Longbow on site A');
-    } else if (n === 3) {
-      // Buy phase at the Vanguard spawn, menu open.
-      this.rounds.phase = 'buy';
-      this.rounds.phaseTimer = 14;
-      p.reset(-24, 18, Math.PI);
-      p.money = 4200;
-      this.hud.toggleBuy(true);
-      this.hud.hint('Demo 3 — Buy menu');
-    } else {
-      // Planting at site B: player on the charge facing west down Mid
-      // toward the defenders closing in, plant channel running.
-      p.reset(24, -10, Math.PI / 2);
-      p.keys['KeyE'] = true;
-      this.rounds.phase = 'live';
-      sBots[0].reset(14, -18, 0, null);
-      sBots[1].reset(8, -8, 0, null);
-      sBots[2].reset(18, -3, 0, null);
-      vBots[0].reset(20, -12, Math.PI, null);
-      this.hud.hint('Demo 4 — Planting at B');
-    }
-    // Let the scene settle one frame so the screenshot catches the pose.
-    this.step(1 / 60);
+function handlePlayerHit(rec) {
+  hud.hitmark(false);
+  const a = rec.by;
+  const ang = Math.atan2(-(a.pos.x - player.pos.x), -(a.pos.z - player.pos.z));
+  hud.damage(ang);
+  audio.hurt();
+  if (player.health <= 0) {
+    player.weaponState.triggerHeld = false;
   }
 }
 
-const game = new Game();
-game.start();
-window.__game = game;
-window.__shots = 0;
+function nearestSite(x, z) {
+  let best = null;
+  let bestD = 15;
+  for (const key of ['A', 'B']) {
+    const s = SITES[key];
+    const d = dist2D(x, z, s.x, s.z);
+    if (d < bestD) {
+      bestD = d;
+      best = key;
+    }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------- input
+const controller = new PlayerController(player, camera, renderer.domElement, audio);
+controller.onReload = () => {
+  if (startReload(player.loadout, player.weaponState, game.now)) audio.reload();
+};
+controller.onSwitch = (id) => {
+  if (switchWeapon(player.loadout, player.weaponState, id, game.now)) audio.reload();
+};
+controller.onBuyToggle = () => {
+  if (match.phase === 'buy') hud.setBuyMenu(!hud.isBuyMenuOpen());
+};
+controller.onGrenade = (kind) => {
+  if (match.phase !== 'live' || player.health <= 0) return;
+  const dir = controller.aimDir();
+  combat.throwGrenade(player, kind, dir, game.now);
+};
+
+function buyRequest(kind, id) {
+  if (match.playerBuy(kind, id)) audio.buy();
+}
+
+// auto-pilot for the player in smoke mode
+if (SMOKE) {
+  player.bot = makeBotState('vanguard', BOT.vanguard, rng);
+  player.isBot = true;
+  player.isPlayer = false;
+  hud.hideCenter();
+} else {
+  hud.showCenter();
+  renderer.domElement.addEventListener('click', () => hud.hideCenter(), { once: true });
+}
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'KeyR' && match.winner) location.reload();
+});
+
+// ---------------------------------------------------------------- shot mode
+const SHOT_CAM = {
+  1: { pos: [-26, 2.2, -6], yaw: -1.35, pitch: -0.02 },
+  2: { pos: [14, 2.4, 20], yaw: -0.93, pitch: -0.06 },
+  3: { pos: [-24, 2.4, -9], yaw: -1.15, pitch: -0.04 },
+  4: { pos: [-30, 16, -20], yaw: -2.4, pitch: -0.5 },
+};
+let freeCam = null;
+let shotFrozen = false;
+if (SHOT) {
+  hud.hideCenter();
+}
+if (DEMO) {
+  hud.hideCenter();
+  const c = SHOT_CAM[DEMO] || SHOT_CAM[1];
+  freeCam = c;
+}
+
+// ---------------------------------------------------------------- sim
+let accumulator = 0;
+let frameNo = 0;
+let lastT = performance.now();
+let smokeSteps = 0;
+
+function agentMeshSync(a, dt) {
+  const m = a.mesh;
+  if (!m) return;
+  m.position.set(a.pos.x, a.y, a.pos.z);
+  m.rotation.y = a.yaw + Math.PI; // meshes face +Z; yaw 0 faces -Z
+  m.visible = a.health > 0 || a.isPlayer;
+  const dead = a.health <= 0;
+  m.rotation.z = dead ? Math.PI / 2 : 0;
+  m.position.y = dead ? 0.25 : a.y;
+  // walk swing
+  if (a.speed2D > 0.5 && !dead) {
+    a.walkPhase += dt * a.speed2D * 2.4;
+    const s = Math.sin(a.walkPhase) * 0.5;
+    m.userData.legL.rotation.x = s;
+    m.userData.legR.rotation.x = -s;
+    m.userData.armL.rotation.x = -0.7 - s * 0.4;
+    m.userData.armR.rotation.x = -0.7 + s * 0.4;
+  }
+  // health bar
+  const hp = clamp(a.health / 100, 0, 1);
+  a.hpBar.scale.x = 0.9 * hp;
+  a.hpBar.material.color.setHex(hp > 0.5 ? 0x37d67a : hp > 0.25 ? 0xffc36b : 0xff5252);
+  a.hpBar.visible = !dead && a.health < 100;
+  a.hpBg.visible = !dead && a.health < 100;
+}
+
+function playerShoot(now) {
+  if (player.health <= 0 || match.phase !== 'live') return;
+  const dir = controller.aimDir();
+  const rec = combat.shoot(player, dir, agents, WALLS, rng, now);
+  if (rec && rec.blocked === 'empty') {
+    audio.dryFire();
+    return;
+  }
+  if (rec && rec.fired) {
+    muzzle.intensity = 14;
+    viewmodel.position.z = -0.5; // recoil kick
+  }
+  if (rec && rec.killed) handleKill(rec);
+  else if (rec && rec.hit) {
+    hud.hitmark(rec.killed);
+    audio.hit();
+    if (rec.hit === player) handlePlayerHit(rec);
+  }
+  // hearing: enemies learn the shot
+  for (const a of agents) {
+    if (a.team === player.team || a.health <= 0 || !a.isBot) continue;
+    if (dist2D(a.pos.x, a.pos.z, player.pos.x, player.pos.z) < BOT.hearRadius) {
+      a.bot.heard = { x: player.pos.x, z: player.pos.z, site: nearestSite(player.pos.x, player.pos.z), t: now };
+    }
+  }
+}
+
+let lastShots = 0; // for the quiet-round clock in Match.tick
+function fixedStep(dt) {
+  const now = game.now;
+  match.tick(dt, now);
+  match.maybeNextRound(now);
+
+  // reload completion + bot auto-reload (bots never press R: if the mag is
+  // dry, start a reload; if the reserve is gone, fall back to the sidearm)
+  for (const a of agents) {
+    const st = a.weaponState;
+    if (st.reloading && now >= st.reloadEndAt) finishReload(a.loadout, st);
+    if (a.isBot && !st.reloading) {
+      const w = a.loadout.weapons[a.loadout.current];
+      if (w && w.mag <= 0) {
+        if (!startReload(a.loadout, st, now) && a.loadout.current !== 'p9' && a.loadout.weapons.p9) {
+          switchWeapon(a.loadout, st, 'p9', now);
+        }
+      }
+    }
+    tickWeapon(st, dt, now);
+  }
+
+  // player
+  if (!SMOKE && player.health > 0 && match.phase === 'live') {
+    controller.tick(dt, WALLS, now);
+    if (player.weaponState.triggerHeld) playerShoot(now);
+  } else if (SMOKE && player.health > 0) {
+    updateBot(player, game, dt, now);
+    // autopilot firing is handled inside updateBot via burstFire
+  }
+
+  // bots
+  for (const a of agents) {
+    if (a === player) continue;
+    if (a.health <= 0) continue;
+    updateBot(a, game, dt, now);
+  }
+
+  // grenades
+  combat.tickGrenades(dt, agents, WALLS, now, (rec) => handleKill(rec));
+
+  // quiet-round clock: any shot fired counts as combat
+  if (combat.stats.shots !== lastShots) {
+    match.lastCombatAt = now;
+    lastShots = combat.stats.shots;
+  }
+
+  // enemy visibility memory for the minimap
+  for (const a of agents) {
+    if (a.team === player.team || a.health <= 0) continue;
+    const dx = a.pos.x - player.pos.x;
+    const dz = a.pos.z - player.pos.z;
+    const d = Math.sqrt(dx * dx + dz * dz);
+    if (d < 40) a.lastSeenByPlayer = now;
+  }
+
+  // spike carrier death already drops via handleKill
+  game.now += dt;
+}
+
+// ---------------------------------------------------------------- render
+const clock = { last: performance.now() };
+function frame() {
+  requestAnimationFrame(frame);
+  const t = performance.now();
+  let dt = (t - clock.last) / 1000;
+  clock.last = t;
+  if (dt > 0.25) dt = 0.25;
+
+  if (SHOT && !shotFrozen) {
+    // shot mode: warm the round up fast, then freeze on the vantage
+    const warmup = SHOT === '3' ? 1.5 : 7;
+    accumulator += dt;
+    let steps = 0;
+    while (accumulator >= FIXED && steps < 10) {
+      fixedStep(FIXED);
+      accumulator -= FIXED;
+      steps++;
+    }
+    if (game.now >= warmup) {
+      shotFrozen = true;
+      freeCam = SHOT_CAM[SHOT] || SHOT_CAM[1];
+      window.__shotReady = true;
+    }
+  } else if (!freeCam) {
+    accumulator += dt;
+    const maxSteps = SMOKE ? 30 : 5; // smoke: burn sim time fast under SwiftShader
+    let steps = 0;
+    while (accumulator >= FIXED && steps < maxSteps) {
+      fixedStep(FIXED);
+      accumulator -= FIXED;
+      steps++;
+    }
+    if (steps === maxSteps) accumulator = 0;
+  }
+
+  // visuals that run every frame
+  const time = t / 1000;
+  world.furnaceLight.intensity = 55 + Math.sin(time * 7.3) * 8 + Math.sin(time * 13.7) * 5;
+  for (const key of ['A', 'B']) {
+    const mk = world.siteMarkers[key];
+    mk.bill.position.y = mk.baseY + Math.sin(time * 1.4 + (key === 'A' ? 0 : 2)) * 0.25;
+    mk.bill.lookAt(camera.position);
+    mk.ring.material.opacity = 0.4 + Math.sin(time * 2.2) * 0.15;
+  }
+  const ep = world.embers.geometry.attributes.position;
+  for (let i = 0; i < ep.count; i++) {
+    let y = ep.getY(i) + dt * (0.6 + world.emberSeed[i] * 0.8);
+    if (y > 9) y = 0.2;
+    ep.setY(i, y);
+    ep.setX(i, ep.getX(i) + Math.sin(time + i) * dt * 0.2);
+  }
+  ep.needsUpdate = true;
+
+  for (const a of agents) agentMeshSync(a, dt);
+  if (player.health <= 0 && !SMOKE) {
+    // death cam: high spectator view
+    camera.position.set(-10, 18, -14);
+    camera.lookAt(0, 0, 0);
+  } else if (!freeCam && !SMOKE) {
+    // player camera is set by the controller; viewmodel follows
+    viewmodel.position.z += ((-0.55) - viewmodel.position.z) * dt * 10;
+    muzzle.intensity = Math.max(0, muzzle.intensity - dt * 160);
+  }
+  if (freeCam) {
+    // spectator camera: never show the first-person rifle in front of it
+    viewmodel.visible = false;
+    camera.position.set(freeCam.pos[0], freeCam.pos[1], freeCam.pos[2]);
+    camera.rotation.set(freeCam.pitch, freeCam.yaw, 0, 'YXZ');
+  }
+
+  hud.update(game, game.now);
+  combat.tickTracers(dt);
+  // smoke: render only every 3rd frame — SwiftShader is the bottleneck and
+  // the sim is what the smoke test measures
+  frameNo++;
+  if (!SMOKE || frameNo % 3 === 0) renderer.render(scene, camera);
+}
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------------------------------------------------------------- smoke
+function finishSmoke() {
+  const result = {
+    errors,
+    winner: match.winner,
+    score: { ...match.score },
+    rounds: match.roundLog,
+    kills: combat.stats.kills,
+    shots: combat.stats.shots,
+    hits: combat.stats.hits,
+    accuracy: combat.stats.shots ? +(combat.stats.hits / combat.stats.shots).toFixed(3) : 0,
+    simSeconds: +game.now.toFixed(1),
+  };
+  window.__smokeResult = result;
+  console.log('SMOKE_RESULT ' + JSON.stringify(result));
+}
+
+if (SMOKE) {
+  // shorter rounds for the headless run, same rules
+  MAP.buyTime = 2;
+  MAP.roundTime = 45;
+}
+// debug handle: lets a headless probe inspect live state (positions,
+// health, spike, round) without touching the game
+window.__rustline = { game, match, agents, combat };
+match.startMatch();
+if (SHOT && SHOT !== '3') {
+  // action shots: skip the buy phase so bots are mid-round when frozen
+  match.phase = 'live';
+  match.timeLeft = 90;
+  match.lastCombatAt = game.now;
+}
+frame();

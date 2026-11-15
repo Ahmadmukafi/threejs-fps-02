@@ -1,220 +1,263 @@
-// RUSTLINE — the Foundry Yard map: geometry, colliders, sight occlusion, paths.
-// The map is built once from CONFIG; collision and line-of-sight are cheap 2D
-// tests in the XZ plane, so bots can think every frame without raycasts.
-
+// RUSTLINE — round 3. The map: Foundry Yard, a 64 x 44 m industrial foundry
+// at dusk. Builds the three.js scene from config: floor, perimeter walls,
+// the furnace block, crates, site markers, dusk lighting and embers.
+// All textures are generated on canvas at runtime — no external assets.
 import * as THREE from 'three';
-import { CONFIG, WALLS, WAYPOINTS, SITES } from './config.js';
+import { MAP, WALLS, SITES } from './config.js';
 
-// A ground texture painted on a canvas: concrete slabs, rust stains, lane paint.
-function groundTexture() {
+function canvasTexture(w, h, draw) {
   const c = document.createElement('canvas');
-  c.width = 512; c.height = 512;
-  const g = c.getContext('2d');
-  g.fillStyle = '#33302b'; g.fillRect(0, 0, 512, 512);
-  // Concrete slabs.
-  g.strokeStyle = '#2a2723'; g.lineWidth = 3;
-  for (let i = 0; i <= 8; i++) {
-    g.beginPath(); g.moveTo(i * 64, 0); g.lineTo(i * 64, 512); g.stroke();
-    g.beginPath(); g.moveTo(0, i * 64); g.lineTo(512, i * 64); g.stroke();
-  }
-  // Rust stains and scuffs.
-  for (let i = 0; i < 90; i++) {
-    const x = Math.random() * 512, y = Math.random() * 512, r = 4 + Math.random() * 26;
-    g.fillStyle = Math.random() < 0.5 ? 'rgba(120,66,30,0.16)' : 'rgba(0,0,0,0.14)';
-    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
-  }
-  // Faded lane paint: amber centre line, white site rings.
-  g.strokeStyle = 'rgba(210,160,60,0.5)'; g.lineWidth = 5;
-  g.beginPath(); g.moveTo(256, 40); g.lineTo(256, 472); g.stroke();
-  g.strokeStyle = 'rgba(230,230,230,0.35)'; g.lineWidth = 4;
-  g.beginPath(); g.arc(96, 96, 46, 0, Math.PI * 2); g.stroke();
-  g.beginPath(); g.arc(416, 96, 46, 0, Math.PI * 2); g.stroke();
-  const tex = new THREE.CanvasTexture(c);
-  tex.wrapS = THREE.RepeatWrapping; tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(4, 3); tex.anisotropy = 4;
-  return tex;
+  c.width = w;
+  c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4;
+  return t;
 }
 
-function box(w, h, d, color, roughness = 0.85, metalness = 0.15) {
-  const m = new THREE.Mesh(
-    new THREE.BoxGeometry(w, h, d),
-    new THREE.MeshStandardMaterial({ color, roughness, metalness }),
-  );
-  m.castShadow = true; m.receiveShadow = true;
-  return m;
-}
-
-// 2D segment vs AABB test (slab method) — used for sight occlusion in XZ.
-export function segmentBlocked(ax, az, bx, bz, walls) {
-  const dx = bx - ax, dz = bz - az;
-  for (let i = 0; i < walls.length; i++) {
-    const w = walls[i];
-    const minX = w[0] - w[2], maxX = w[0] + w[2];
-    const minZ = w[1] - w[3], maxZ = w[1] + w[3];
-    // Only walls tall enough to block sight (crates are low cover).
-    if (w[4] < 2.0) continue;
-    let t0 = 0, t1 = 1;
-    if (Math.abs(dx) < 1e-9) { if (ax < minX || ax > maxX) continue; }
-    else {
-      let ta = (minX - ax) / dx, tb = (maxX - ax) / dx;
-      if (ta > tb) { const t = ta; ta = tb; tb = t; }
-      t0 = Math.max(t0, ta); t1 = Math.min(t1, tb);
-      if (t0 > t1) continue;
+function floorTexture() {
+  return canvasTexture(512, 512, (g, w, h) => {
+    g.fillStyle = '#2b2b30';
+    g.fillRect(0, 0, w, h);
+    // concrete slabs
+    g.strokeStyle = 'rgba(0,0,0,0.45)';
+    g.lineWidth = 3;
+    for (let i = 0; i <= 4; i++) {
+      g.beginPath(); g.moveTo((i * w) / 4, 0); g.lineTo((i * w) / 4, h); g.stroke();
+      g.beginPath(); g.moveTo(0, (i * h) / 4); g.lineTo(w, (i * h) / 4); g.stroke();
     }
-    if (Math.abs(dz) < 1e-9) { if (az < minZ || az > maxZ) continue; }
-    else {
-      let ta = (minZ - az) / dz, tb = (maxZ - az) / dz;
-      if (ta > tb) { const t = ta; ta = tb; tb = t; }
-      t0 = Math.max(t0, ta); t1 = Math.min(t1, tb);
-      if (t0 > t1) continue;
+    // speckle + stains
+    for (let i = 0; i < 2600; i++) {
+      const v = Math.random();
+      g.fillStyle = v < 0.5 ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.08)';
+      g.fillRect(Math.random() * w, Math.random() * h, 2, 2);
     }
-    return true;
-  }
-  return false;
-}
-
-// Breadth-first search over the waypoint graph; returns an array of node ids.
-export function findPath(from, to) {
-  if (from === to) return [to];
-  const prev = new Int16Array(WAYPOINTS.length).fill(-1);
-  const queue = [from];
-  prev[from] = from;
-  while (queue.length) {
-    const cur = queue.shift();
-    for (const n of WAYPOINTS[cur].links) {
-      if (prev[n] !== -1) continue;
-      prev[n] = cur;
-      if (n === to) {
-        const path = [to];
-        let p = cur;
-        while (p !== from) { path.unshift(p); p = prev[p]; }
-        path.unshift(from);
-        return path;
-      }
-      queue.push(n);
+    // oil stains near the furnace lane
+    for (let i = 0; i < 14; i++) {
+      g.fillStyle = 'rgba(10,10,12,0.25)';
+      g.beginPath();
+      g.ellipse(Math.random() * w, Math.random() * h, 18 + Math.random() * 30, 10 + Math.random() * 18, Math.random() * 3, 0, Math.PI * 2);
+      g.fill();
     }
-  }
-  return [from, to];
-}
-
-export function nearestWaypoint(x, z) {
-  let best = 0, bd = Infinity;
-  for (let i = 0; i < WAYPOINTS.length; i++) {
-    const dx = WAYPOINTS[i].x - x, dz = WAYPOINTS[i].z - z;
-    const d = dx * dx + dz * dz;
-    if (d < bd) { bd = d; best = i; }
-  }
-  return best;
-}
-
-// Circle (radius r) vs wall AABBs in XZ; returns the corrected position.
-export function collideCircle(x, z, r, walls) {
-  for (let i = 0; i < walls.length; i++) {
-    const w = walls[i];
-    const minX = w[0] - w[2] - r, maxX = w[0] + w[2] + r;
-    const minZ = w[1] - w[3] - r, maxZ = w[1] + w[3] + r;
-    if (x > minX && x < maxX && z > minZ && z < maxZ) {
-      const pushL = x - minX, pushR = maxX - x;
-      const pushT = z - minZ, pushB = maxZ - z;
-      const m = Math.min(pushL, pushR, pushT, pushB);
-      if (m === pushL) x = minX; else if (m === pushR) x = maxX;
-      else if (m === pushT) z = minZ; else z = maxZ;
+    // hazard chevrons along the mid lane
+    g.save();
+    g.translate(w / 2, h / 2);
+    g.fillStyle = '#c9a227';
+    for (let i = -3; i <= 3; i++) {
+      g.save();
+      g.translate(i * 46, 0);
+      g.rotate(Math.PI / 4);
+      g.fillRect(-14, -4, 28, 8);
+      g.restore();
     }
-  }
-  const hx = CONFIG.map.halfX - r, hz = CONFIG.map.halfZ - r;
-  x = Math.max(-hx, Math.min(hx, x));
-  z = Math.max(-hz, Math.min(hz, z));
-  return { x, z };
+    g.restore();
+  });
 }
 
+function wallTexture() {
+  return canvasTexture(256, 256, (g, w, h) => {
+    g.fillStyle = '#3a3f46';
+    g.fillRect(0, 0, w, h);
+    // panel seams
+    g.strokeStyle = 'rgba(0,0,0,0.5)';
+    g.lineWidth = 2;
+    g.strokeRect(4, 4, w - 8, h - 8);
+    g.beginPath(); g.moveTo(w / 2, 4); g.lineTo(w / 2, h - 4); g.stroke();
+    // rivets
+    g.fillStyle = 'rgba(255,255,255,0.16)';
+    for (const [x, y] of [[14, 14], [w - 14, 14], [14, h - 14], [w - 14, h - 14], [w / 2, 14], [w / 2, h - 14]]) {
+      g.beginPath(); g.arc(x, y, 3, 0, Math.PI * 2); g.fill();
+    }
+    // grime at the bottom
+    const grad = g.createLinearGradient(0, h - 70, 0, h);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, 'rgba(0,0,0,0.55)');
+    g.fillStyle = grad;
+    g.fillRect(0, h - 70, w, 70);
+    // faint rust streaks
+    for (let i = 0; i < 10; i++) {
+      g.fillStyle = 'rgba(120,70,30,0.12)';
+      const x = Math.random() * w;
+      g.fillRect(x, 20 + Math.random() * 40, 3 + Math.random() * 5, 60 + Math.random() * 90);
+    }
+  });
+}
+
+function siteLabelTexture(letter, css) {
+  return canvasTexture(256, 256, (g, w, h) => {
+    g.clearRect(0, 0, w, h);
+    g.strokeStyle = css;
+    g.lineWidth = 10;
+    g.globalAlpha = 0.95;
+    g.beginPath(); g.arc(w / 2, h / 2, 100, 0, Math.PI * 2); g.stroke();
+    g.beginPath(); g.arc(w / 2, h / 2, 82, 0, Math.PI * 2); g.stroke();
+    g.fillStyle = css;
+    g.font = 'bold 150px Arial, sans-serif';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(letter, w / 2, h / 2 + 6);
+  });
+}
+
+/** Build the whole map. Returns { group, siteMarkers, furnaceLight, embers }. */
 export function buildWorld(scene) {
   const group = new THREE.Group();
   scene.add(group);
 
-  // Dusk sky: warm horizon fog, cool hemisphere light, low amber sun.
-  scene.background = new THREE.Color(0x2b1d16);
-  scene.fog = new THREE.Fog(0x2b1d16, 28, 95);
-  const hemi = new THREE.HemisphereLight(0x8a7a68, 0x1c1712, 0.85);
-  scene.add(hemi);
-  const sun = new THREE.DirectionalLight(0xffb36b, 1.6);
-  sun.position.set(-28, 26, 14);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -40; sun.shadow.camera.right = 40;
-  sun.shadow.camera.top = 40; sun.shadow.camera.bottom = -40;
-  sun.shadow.camera.far = 90;
-  scene.add(sun);
-  // Warm point lights over the furnace and the storehouse.
-  const glowA = new THREE.PointLight(0xff7a2a, 60, 26, 1.6);
-  glowA.position.set(SITES.A.x, 3.4, SITES.A.z);
-  scene.add(glowA);
-  const glowB = new THREE.PointLight(0xffc46b, 40, 22, 1.6);
-  glowB.position.set(SITES.B.x, 3.4, SITES.B.z);
-  scene.add(glowB);
+  const floorTex = floorTexture();
+  floorTex.repeat.set(8, 5.5);
+  const wallTex = wallTexture();
 
-  // Ground.
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(66, 46),
-    new THREE.MeshStandardMaterial({ map: groundTexture(), roughness: 0.95 }),
-  );
-  ground.rotation.x = -Math.PI / 2;
-  ground.receiveShadow = true;
-  group.add(ground);
+  const floorMat = new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.92, metalness: 0.08 });
+  const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.85, metalness: 0.25 });
+  const darkMetal = new THREE.MeshStandardMaterial({ color: 0x23262b, roughness: 0.6, metalness: 0.7 });
+  const crateMat = new THREE.MeshStandardMaterial({ color: 0x6b5a33, roughness: 0.9, metalness: 0.1 });
+  const crateMat2 = new THREE.MeshStandardMaterial({ color: 0x4a5240, roughness: 0.9, metalness: 0.1 });
+  const furnaceMat = new THREE.MeshStandardMaterial({ color: 0x1c1a18, roughness: 0.55, metalness: 0.85, emissive: 0x662200, emissiveIntensity: 0.35 });
+  const glowMat = new THREE.MeshStandardMaterial({ color: 0x1a0c00, emissive: 0xff6a00, emissiveIntensity: 2.4 });
 
-  // Walls from the layout: outer shell tall and dark, furnace blocks rusted,
-  // crates in hazard yellow and olive.
-  const palette = [0x3a352f, 0x4a3a28, 0x5a4a20, 0x3c4a2e];
-  for (let i = 0; i < WALLS.length; i++) {
-    const w = WALLS[i];
-    const isShell = i < 4;
-    const color = isShell ? 0x35302a : palette[i % palette.length];
-    const m = box(w[2] * 2, w[4], w[3] * 2, color);
-    m.position.set(w[0], w[4] / 2, w[1]);
+  // floor
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(MAP.halfX * 2 + 2, MAP.halfZ * 2 + 2), floorMat);
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  group.add(floor);
+
+  // walls + crates from config
+  const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+  for (const w of WALLS) {
+    const tall = w.h >= 4.5;
+    const mat = tall ? wallMat : (w.h <= 1.8 ? crateMat : crateMat2);
+    const m = new THREE.Mesh(boxGeo, mat);
+    m.scale.set(w.w, w.h, w.d);
+    m.position.set(w.x, w.h / 2, w.z);
+    m.castShadow = tall;
+    m.receiveShadow = true;
     group.add(m);
-    // Rust trim on the furnace wall.
-    if (i === 4 || i === 5) {
-      const trim = box(w[2] * 2, 0.18, w[3] * 2 + 0.1, 0xb05a1e, 0.6, 0.4);
-      trim.position.set(w[0], w[4] + 0.09, w[1]);
-      group.add(trim);
+    // low crates get a darker lid so they read as cover, not walls
+    if (!tall) {
+      const lid = new THREE.Mesh(new THREE.BoxGeometry(w.w + 0.08, 0.1, w.d + 0.08), darkMetal);
+      lid.position.set(w.x, w.h + 0.05, w.z);
+      lid.castShadow = true;
+      group.add(lid);
     }
   }
 
-  // The furnace itself: a glowing mouth on site A, chimney stacks, pipes.
-  const mouth = new THREE.Mesh(
-    new THREE.PlaneGeometry(3.4, 1.6),
-    new THREE.MeshBasicMaterial({ color: 0xff6a1a }),
-  );
-  mouth.position.set(-24, 1.1, -15.9);
-  mouth.rotation.y = 0;
-  group.add(mouth);
-  const chimney = box(1.6, 7, 1.6, 0x2e2a26, 0.7, 0.5);
-  chimney.position.set(-29.5, 3.5, -15);
-  group.add(chimney);
-  const chimney2 = box(1.2, 5.5, 1.2, 0x2e2a26, 0.7, 0.5);
-  chimney2.position.set(29.5, 2.75, -15);
-  group.add(chimney2);
-  // Overhead pipes along the north edge.
-  for (const px of [-16, 0, 16]) {
-    const pipe = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.32, 0.32, 8, 10),
-      new THREE.MeshStandardMaterial({ color: 0x6b5a3a, roughness: 0.5, metalness: 0.7 }),
-    );
-    pipe.rotation.z = Math.PI / 2;
-    pipe.position.set(px, 4.6, -20.5);
-    pipe.castShadow = true;
-    group.add(pipe);
+  // furnace: glowing slits + chimney + heat shimmer cone
+  const furnace = group.children.find((c) => c.position.x === 0 && c.position.z === 0);
+  void furnace;
+  const slitGeo = new THREE.BoxGeometry(7.2, 0.5, 0.15);
+  for (const z of [-3.05, 3.05]) {
+    const slit = new THREE.Mesh(slitGeo, glowMat);
+    slit.position.set(0, 1.1, z);
+    group.add(slit);
   }
-  // Site markers: glowing floor rings.
+  const chimney = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.5, 9, 10), darkMetal);
+  chimney.position.set(0, 5.5 + 4.5, 0);
+  chimney.castShadow = true;
+  group.add(chimney);
+  const chimneyGlow = new THREE.Mesh(new THREE.CylinderGeometry(1.15, 1.15, 0.4, 10), glowMat);
+  chimneyGlow.position.set(0, 10.1, 0);
+  group.add(chimneyGlow);
+
+  // distant silhouettes outside the yard: cranes + chimneys against the dusk
+  const silMat = new THREE.MeshStandardMaterial({ color: 0x14161c, roughness: 1, metalness: 0 });
+  const silhouettes = [
+    [-46, -30, 2, 16], [46, -28, 2.5, 20], [-48, 26, 3, 12], [48, 30, 2, 18], [-40, 0, 2, 22],
+  ];
+  for (const [x, z, r, h] of silhouettes) {
+    const s = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 1.4, h, 8), silMat);
+    s.position.set(x, h / 2, z);
+    group.add(s);
+  }
+  // crane arm
+  const crane = new THREE.Mesh(new THREE.BoxGeometry(26, 1.2, 1.2), silMat);
+  crane.position.set(-38, 19, -18);
+  crane.rotation.z = 0.12;
+  group.add(crane);
+
+  // ---- site markers: floating hologram letters + glowing ground rings ------
+  const siteMarkers = {};
   for (const key of ['A', 'B']) {
-    const s = SITES[key];
+    const site = SITES[key];
+    const tex = siteLabelTexture(key, site.css);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
+    const bill = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 3.4), mat);
+    bill.position.set(site.x, 4.6, site.z);
+    group.add(bill);
+    // ground ring
     const ring = new THREE.Mesh(
-      new THREE.RingGeometry(s.r - 0.25, s.r, 40),
-      new THREE.MeshBasicMaterial({ color: key === 'A' ? 0xff8a3c : 0xffc46b, side: THREE.DoubleSide, transparent: true, opacity: 0.55 }),
+      new THREE.RingGeometry(2.2, 2.7, 40),
+      new THREE.MeshBasicMaterial({ color: site.color, transparent: true, opacity: 0.55, side: THREE.DoubleSide }),
     );
     ring.rotation.x = -Math.PI / 2;
-    ring.position.set(s.x, 0.03, s.z);
+    ring.position.set(site.x, 0.06, site.z);
     group.add(ring);
+    // light pool
+    const pool = new THREE.PointLight(site.color, 14, 16, 1.8);
+    pool.position.set(site.x, 3.2, site.z);
+    group.add(pool);
+    siteMarkers[key] = { bill, ring, pool, baseY: 4.6 };
   }
 
-  return { group, walls: WALLS };
+  // ---- lighting: dusk -------------------------------------------------------
+  const hemi = new THREE.HemisphereLight(0xff9a5c, 0x1a2028, 0.55);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xffb36b, 1.9);
+  sun.position.set(-28, 16, -18);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -40;
+  sun.shadow.camera.right = 40;
+  sun.shadow.camera.top = 30;
+  sun.shadow.camera.bottom = -30;
+  sun.shadow.camera.far = 90;
+  sun.shadow.bias = -0.0004;
+  scene.add(sun);
+  // furnace glow, flickers in main.js
+  const furnaceLight = new THREE.PointLight(0xff6a00, 60, 26, 1.6);
+  furnaceLight.position.set(0, 2.2, 0);
+  scene.add(furnaceLight);
+  // cool fill from the east so Sentinel's side is not pitch black
+  const fill = new THREE.DirectionalLight(0x6a86c8, 0.35);
+  fill.position.set(30, 12, 10);
+  scene.add(fill);
+
+  // ---- dusk sky dome --------------------------------------------------------
+  const skyGeo = new THREE.SphereGeometry(220, 24, 12);
+  const skyMat = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+    uniforms: {
+      top: { value: new THREE.Color(0x1b2340) },
+      mid: { value: new THREE.Color(0xb4552d) },
+      low: { value: new THREE.Color(0xff8c3a) },
+    },
+    vertexShader: 'varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: `varying vec3 vP; uniform vec3 top; uniform vec3 mid; uniform vec3 low;
+      void main(){ float h = normalize(vP).y; vec3 c = h > 0.25 ? mix(mid, top, smoothstep(0.25, 0.8, h)) : mix(low, mid, smoothstep(-0.05, 0.25, h)); gl_FragColor = vec4(c, 1.0); }`,
+  });
+  const sky = new THREE.Mesh(skyGeo, skyMat);
+  scene.add(sky);
+  scene.fog = new THREE.Fog(0x2a1c22, 55, 160);
+
+  // ---- embers: drifting sparks above the furnace ----------------------------
+  const emberCount = 160;
+  const emberPos = new Float32Array(emberCount * 3);
+  const emberSeed = new Float32Array(emberCount);
+  for (let i = 0; i < emberCount; i++) {
+    emberPos[i * 3] = (Math.random() - 0.5) * 10;
+    emberPos[i * 3 + 1] = Math.random() * 8;
+    emberPos[i * 3 + 2] = (Math.random() - 0.5) * 8;
+    emberSeed[i] = Math.random();
+  }
+  const emberGeo = new THREE.BufferGeometry();
+  emberGeo.setAttribute('position', new THREE.BufferAttribute(emberPos, 3));
+  const emberMat = new THREE.PointsMaterial({ color: 0xffa040, size: 0.14, transparent: true, opacity: 0.9, depthWrite: false });
+  const embers = new THREE.Points(emberGeo, emberMat);
+  group.add(embers);
+
+  return { group, siteMarkers, furnaceLight, embers, emberSeed };
 }

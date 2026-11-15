@@ -1,159 +1,277 @@
-// RUSTLINE — rounds: the match state machine.
-// buy (15 s) -> live (100 s) -> end -> next round, first to 5 (max 9).
-// Vanguard attacks and plants; Sentinel defends and defuses. Every round
-// end pays the economy and the HUD banner names the reason.
+// RUSTLINE — round 3. Match and round state: buy phase, live round, round
+// end, economy, the spike (plant / defuse / detonate), and match end.
+// First to 5, at most 9 rounds; a 4-4 tie is decided by round 9.
+import { MAP, ECONOMY, WEAPONS, GRENADES, VEST_PRICE, SPAWNS, SITES } from './config.js';
+import { makeLoadout, buyWeapon, buyGrenade, buyVest } from './weapons.js';
+import { assignRoundRoles } from './bots.js';
 
-import { CONFIG, SITES, SPAWNS } from './config.js';
-
-export class RoundManager {
-  constructor(game) {
+export class Match {
+  constructor(agents, game) {
+    this.agents = agents;
     this.game = game;
-    this.round = 0;
     this.score = { vanguard: 0, sentinel: 0 };
-    this.phase = 'lobby';
-    this.phaseTimer = 0;
-    this.fuseTimer = 0;
-    this.attackSite = 'A';
-    this.bombState = 'carried'; // carried | planted | exploded | defused
-    this.bombSite = null;
-    this.carrier = null;
+    this.roundNum = 0;
+    this.phase = 'buy'; // buy | live | over
+    this.timeLeft = MAP.buyTime;
+    this.spike = { state: 'carried', site: null, carrier: null, plantedAt: 0, pos: null };
+    this.lossStreak = { vanguard: 0, sentinel: 0 };
     this.roundLog = [];
-    this.matchOver = false;
     this.winner = null;
+    this.lastCombatAt = 0;
+    this.nudgeFired = false;
+    this.onEvent = null; // (event) => void — HUD / feed
+    this.onRoundEnd = null;
+    this.onMatchEnd = null;
+  }
+
+  emit(type, data) {
+    if (this.onEvent) this.onEvent({ type, ...data });
   }
 
   startMatch() {
-    this.round = 0;
     this.score = { vanguard: 0, sentinel: 0 };
-    this.matchOver = false;
+    this.roundNum = 0;
     this.winner = null;
+    this.roundLog = [];
     this.startRound();
   }
 
   startRound() {
-    this.round += 1;
+    this.roundNum++;
     this.phase = 'buy';
-    this.phaseTimer = CONFIG.round.buySeconds;
-    this.bombState = 'carried';
-    this.bombSite = null;
-    this.fuseTimer = 0;
-    // Alternate the target site each round so both lanes see play.
-    this.attackSite = this.round % 2 === 1 ? 'A' : 'B';
-    const g = this.game;
-    // Spawn the player and the bots.
-    g.player.reset(SPAWNS.vanguard[0][0], SPAWNS.vanguard[0][1], Math.PI);
-    const vBots = g.bots.filter((b) => b.team === 'vanguard');
-    const sBots = g.bots.filter((b) => b.team === 'sentinel');
-    vBots.forEach((b, i) => {
-      const s = SPAWNS.vanguard[(i + 1) % SPAWNS.vanguard.length];
-      b.reset(s[0], s[1], Math.PI, null);
-      b.chooseObjective(g, this.attackSite);
+    this.timeLeft = MAP.buyTime;
+    this.spike = { state: 'carried', site: null, carrier: null, plantedAt: 0, pos: null };
+    this.nudgeFired = false;
+    this.lastCombatAt = 0;
+    // reset agents: positions, health, spike carrier
+    const vanguard = this.agents.filter((a) => a.team === 'vanguard');
+    const sentinel = this.agents.filter((a) => a.team === 'sentinel');
+    vanguard.forEach((a, i) => {
+      const s = SPAWNS.vanguard[i % SPAWNS.vanguard.length];
+      a.pos.x = s.x;
+      a.pos.z = s.z;
+      a.y = 0;
+      a.yaw = -Math.PI / 2; // face east, toward the yard
+      a.health = 100;
+      a.blindedUntil = 0;
+      a.lastDamageAt = -10;
+      if (a.isBot) {
+        a.bot.state = 'idle';
+        a.bot.target = null;
+        a.bot.path = [];
+        a.bot.plantProgress = 0;
+        a.bot.defuseProgress = 0;
+      }
     });
-    sBots.forEach((b, i) => {
+    sentinel.forEach((a, i) => {
       const s = SPAWNS.sentinel[i % SPAWNS.sentinel.length];
-      b.reset(s[0], s[1], 0, [15, 16, 5, 13, 2][i % 5]);
-      b.chooseObjective(g, this.attackSite);
+      a.pos.x = s.x;
+      a.pos.z = s.z;
+      a.y = 0;
+      a.yaw = Math.PI / 2; // face west
+      a.health = 100;
+      a.blindedUntil = 0;
+      a.lastDamageAt = -10;
+      if (a.isBot) {
+        a.bot.state = 'hold';
+        a.bot.target = null;
+        a.bot.path = [];
+        a.bot.holdWp = -1;
+        a.bot.plantProgress = 0;
+        a.bot.defuseProgress = 0;
+      }
     });
-    // The carrier is the first Vanguard bot (the player never carries in
-    // round 1's spirit: bots do the planting, the player covers them).
-    this.carrier = vBots[0] || null;
-    g.hud.banner(`ROUND ${this.round} — ${SITES[this.attackSite].name}`, 'Vanguard pushes ' + SITES[this.attackSite].name);
-    g.sounds.roundStart();
+    // spike carrier: the first living Vanguard bot (or the player)
+    const carrier = vanguard.find((a) => !a.isPlayer) || vanguard[0];
+    this.spike.carrier = carrier;
+    assignRoundRoles(this.agents, this.game.rng);
+    this.emit('roundStart', { round: this.roundNum, carrier: carrier?.name });
   }
 
-  update(dt) {
-    if (this.matchOver) return;
+  /** Auto-buy for bots during the buy phase (simple, role-based). */
+  autoBuy(agent) {
+    const money = agent.money;
+    const loadout = agent.loadout;
+    const rng = this.game.rng;
+    // keep the sidearm; buy a primary if affordable
+    if (!loadout.weapons.vk47 && !loadout.weapons.raptor && money >= WEAPONS.vk47.price) {
+      if (agent.money >= WEAPONS.vk47.price && buyWeapon(loadout, 'vk47')) agent.money -= WEAPONS.vk47.price;
+    } else if (!loadout.weapons.raptor && money >= WEAPONS.raptor.price && money < WEAPONS.vk47.price) {
+      if (buyWeapon(loadout, 'raptor')) agent.money -= WEAPONS.raptor.price;
+    }
+    if (agent.money >= WEAPONS.longshot.price && rng() < 0.25 && !loadout.weapons.longshot) {
+      if (buyWeapon(loadout, 'longshot')) agent.money -= WEAPONS.longshot.price;
+    }
+    if (agent.money >= GRENADES.he.price && rng() < 0.6) {
+      if (buyGrenade(loadout, 'he')) agent.money -= GRENADES.he.price;
+    }
+    if (agent.money >= GRENADES.flash.price && rng() < 0.3) {
+      if (buyGrenade(loadout, 'flash')) agent.money -= GRENADES.flash.price;
+    }
+    if (!loadout.vest && agent.money >= VEST_PRICE && rng() < 0.7) {
+      if (buyVest(loadout)) agent.money -= VEST_PRICE;
+    }
+  }
+
+  /** Player buy. Returns true when the purchase went through. */
+  playerBuy(kind, id) {
+    const agent = this.agents.find((a) => a.isPlayer);
+    if (!agent || this.phase !== 'buy') return false;
+    const loadout = agent.loadout;
+    if (kind === 'weapon') {
+      const def = WEAPONS[id];
+      if (!def || agent.money < def.price || loadout.weapons[id]) return false;
+      if (buyWeapon(loadout, id)) {
+        agent.money -= def.price;
+        return true;
+      }
+    } else if (kind === 'grenade') {
+      const def = GRENADES[id];
+      if (!def || agent.money < def.price) return false;
+      if (buyGrenade(loadout, id)) {
+        agent.money -= def.price;
+        return true;
+      }
+    } else if (kind === 'vest') {
+      if (agent.money < VEST_PRICE || loadout.vest) return false;
+      if (buyVest(loadout)) {
+        agent.money -= VEST_PRICE;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  plantSpike(agent, siteId, now) {
+    if (this.phase !== 'live' || this.spike.state !== 'carried') return;
+    this.spike.state = 'planted';
+    this.spike.site = siteId;
+    this.spike.carrier = null;
+    this.spike.plantedAt = now;
+    this.spike.pos = { x: SITES[siteId].x, z: SITES[siteId].z };
+    // retake delay for Sentinel bots so the plant breathes
+    for (const a of this.agents) {
+      if (a.team === 'sentinel' && a.isBot) a.bot.retakeAt = now + (a.bot.retakeDelay || 0) + this.game.rng() * 0.8;
+    }
+    this.emit('planted', { site: siteId, by: agent.name });
+  }
+
+  defuseSpike(agent, now) {
+    if (this.phase !== 'live' || this.spike.state !== 'planted') return;
+    this.spike.state = 'defused';
+    this.endRound('sentinel', 'defuse', now);
+  }
+
+  dropSpike(agent) {
+    if (this.spike.carrier === agent) {
+      this.spike.state = 'dropped';
+      this.spike.carrier = null;
+      this.spike.pos = { x: agent.pos.x, z: agent.pos.z };
+      this.emit('spikeDropped', { x: agent.pos.x, z: agent.pos.z });
+    }
+  }
+
+  /** One fixed step of the match clock. */
+  tick(dt, now) {
+    if (this.phase === 'over') return;
+    this.timeLeft -= dt;
+
     if (this.phase === 'buy') {
-      this.phaseTimer -= dt;
-      if (this.phaseTimer <= 0) {
+      if (this.timeLeft <= 0) {
         this.phase = 'live';
-        this.phaseTimer = CONFIG.round.roundSeconds;
-        this.game.hud.banner('GO', 'Plant the charge or clear the yard');
+        this.timeLeft = MAP.roundTime;
+        this.lastCombatAt = now;
+        this.emit('live', { round: this.roundNum });
       }
       return;
     }
-    if (this.phase === 'live') {
-      this.phaseTimer -= dt;
-      // If the carrier died, the charge passes to another living Vanguard
-      // fighter — otherwise the bomb is lost with its carrier and Vanguard
-      // can only win by elimination.
-      if (this.bombState === 'carried' && (!this.carrier || !this.carrier.alive)) {
-        const living = this.game.fighters.filter((f) => f.team === 'vanguard' && f.alive);
-        this.carrier = living.length ? living[Math.floor(Math.random() * living.length)] : null;
-        if (this.carrier) this.game.hud.addFeed((this.carrier.name || 'You') + ' picks up the charge');
-      }
-      if (this.bombState === 'planted') {
-        this.fuseTimer -= dt;
-        if (this.fuseTimer <= 0) { this.detonate(); return; }
-      }
-      if (this.phaseTimer <= 0) {
-        // Time out: defenders win unless the bomb is ticking.
-        if (this.bombState !== 'planted') this.endRound('sentinel', 'Time — Sentinel holds the yard');
+
+    // live round
+    if (this.spike.state === 'planted') {
+      const fuseLeft = MAP.fuseTime - (now - this.spike.plantedAt);
+      if (fuseLeft <= 0) {
+        this.spike.state = 'detonated';
+        this.emit('detonated', { site: this.spike.site });
+        this.endRound('vanguard', 'detonation', now);
         return;
       }
-      // Elimination check.
-      const vAlive = this.game.fighters.some((f) => f.team === 'vanguard' && f.alive);
-      const sAlive = this.game.fighters.some((f) => f.team === 'sentinel' && f.alive);
-      if (!vAlive) this.endRound('sentinel', 'Vanguard wiped out');
-      else if (!sAlive) this.endRound('vanguard', 'Sentinel wiped out');
-      return;
     }
-    if (this.phase === 'end') {
-      this.phaseTimer -= dt;
-      if (this.phaseTimer <= 0) {
-        if (this.score.vanguard >= CONFIG.round.winRounds || this.score.sentinel >= CONFIG.round.winRounds || this.round >= CONFIG.round.maxRounds) {
-          this.endMatch();
-        } else {
-          this.startRound();
+
+    // objective nudge: a quiet round gets pushed toward the site — reset
+    // the attackers' state so updateVanguard re-paths them (clearing the
+    // path alone would leave them standing in a stale 'push' state)
+    if (!this.nudgeFired && now - this.lastCombatAt > MAP.idleNudgeAfter && this.spike.state !== 'planted') {
+      this.nudgeFired = true;
+      this.emit('nudge', {});
+      for (const a of this.agents) {
+        if (a.team === 'vanguard' && a.isBot && a.health > 0) {
+          a.bot.state = 'idle';
+          a.bot.target = null;
+          a.bot.peekState = 'none';
+          a.bot.path = [];
+          a.bot.pathIdx = 0;
         }
       }
     }
+
+    if (this.timeLeft <= 0) {
+      // time expires: defenders win unless the spike is planted
+      if (this.spike.state === 'planted') {
+        // fuse handles the outcome; give the round to Sentinel if defused in time — handled above
+        this.endRound('sentinel', 'time', now);
+      } else {
+        this.endRound('sentinel', 'time', now);
+      }
+    }
   }
 
-  plantBomb(siteKey, by) {
-    if (this.bombState !== 'carried' || this.phase !== 'live') return;
-    this.bombState = 'planted';
-    this.bombSite = siteKey;
-    this.fuseTimer = CONFIG.round.fuseSeconds;
-    this.game.hud.banner('CHARGE PLANTED — ' + SITES[siteKey].name, 'Defend the charge · 35 s fuse');
-    this.game.hud.addFeed(`${by.name || 'You'} planted the charge at ${siteKey}`);
-    this.game.sounds.plantBeep(true);
-    if (by.money !== undefined) by.money = (by.money || 0) + CONFIG.economy.plantBonus;
-    this.game.onPlant(siteKey);
+  aliveCount(team) {
+    return this.agents.filter((a) => a.team === team && a.health > 0).length;
   }
 
-  defuseBomb(by) {
-    if (this.bombState !== 'planted') return;
-    this.bombState = 'defused';
-    this.endRound('sentinel', 'Charge defused by ' + (by.name || 'You'));
+  /** Check elimination wins; call after every kill. */
+  checkElimination(now) {
+    if (this.phase !== 'live') return;
+    if (this.spike.state === 'planted') return; // spike decides it
+    if (this.aliveCount('sentinel') === 0) this.endRound('vanguard', 'elimination', now);
+    else if (this.aliveCount('vanguard') === 0) this.endRound('sentinel', 'elimination', now);
   }
 
-  detonate() {
-    this.bombState = 'exploded';
-    this.game.onDetonate(SITES[this.bombSite]);
-    this.endRound('vanguard', 'Charge detonated — ' + SITES[this.bombSite].name + ' is gone');
+  endRound(winnerTeam, reason, now) {
+    if (this.phase === 'over') return;
+    this.phase = 'over';
+    this.score[winnerTeam]++;
+    const loser = winnerTeam === 'vanguard' ? 'sentinel' : 'vanguard';
+    this.lossStreak[winnerTeam] = 0;
+    this.lossStreak[loser] = Math.min(3, this.lossStreak[loser] + 1);
+    // economy
+    for (const a of this.agents) {
+      if (a.team === winnerTeam) {
+        a.money += ECONOMY.winReward;
+        if (a.health > 0) a.money += 0;
+      } else {
+        a.money += ECONOMY.lossReward + this.lossStreak[loser] * ECONOMY.lossStreakBonus;
+      }
+      a.money = Math.min(16000, a.money);
+    }
+    this.roundLog.push({ round: this.roundNum, winner: winnerTeam, reason });
+    this.emit('roundEnd', { round: this.roundNum, winner: winnerTeam, reason, score: { ...this.score } });
+    if (this.onRoundEnd) this.onRoundEnd(this.roundNum, winnerTeam, reason);
+
+    if (this.score[winnerTeam] >= MAP.winRounds || this.roundNum >= MAP.maxRounds) {
+      this.winner = winnerTeam;
+      this.emit('matchEnd', { winner: winnerTeam, score: { ...this.score } });
+      if (this.onMatchEnd) this.onMatchEnd(winnerTeam, { ...this.score });
+      return;
+    }
+    // next round after a short breather (handled by main.js timer)
+    this.nextRoundAt = now + 3.5;
   }
 
-  endRound(winnerTeam, reason) {
-    if (this.phase === 'end') return;
-    this.phase = 'end';
-    this.phaseTimer = 4;
-    this.score[winnerTeam] += 1;
-    this.roundLog.push({ round: this.round, winner: winnerTeam, reason });
-    // Pay the economy (bots carry no money; only the player is paid here).
-    const g = this.game;
-    g.player.money += g.player.team === winnerTeam ? CONFIG.economy.winBonus : CONFIG.economy.lossBonus;
-    g.hud.banner(winnerTeam === 'vanguard' ? 'VANGUARD TAKES THE ROUND' : 'SENTINEL TAKES THE ROUND', reason);
-    g.hud.addFeed(reason);
-    g.sounds.roundEnd(g.player.team === winnerTeam);
-  }
-
-  endMatch() {
-    this.matchOver = true;
-    this.phase = 'done';
-    this.winner = this.score.vanguard > this.score.sentinel ? 'vanguard' : 'sentinel';
-    const g = this.game;
-    g.hud.showMatchEnd(this.winner, this.score, g.player.kills);
-    g.sounds.roundEnd(g.player.team === this.winner);
+  maybeNextRound(now) {
+    if (this.phase === 'over' && !this.winner && this.nextRoundAt && now >= this.nextRoundAt) {
+      this.nextRoundAt = 0;
+      this.startRound();
+    }
   }
 }
